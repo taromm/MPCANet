@@ -1,58 +1,58 @@
-# TMSOD: 热-可见光多模态显著目标检测网络
+# TMSOD: Thermal-Visible Multimodal Salient Object Detection Network
 
-## 📋 模型简介
+## 📋 Model Introduction
 
-TMSOD (Thermo-Modal Salient Object Detection) 是一个基于深度学习的双模态显著目标检测模型，专门设计用于融合RGB可见光图像和热红外图像进行精确的显著目标检测。
+TMSOD (Thermo-Modal Salient Object Detection) is a deep learning-based dual-modal salient object detection model specifically designed to fuse RGB visible light images and thermal infrared images for accurate salient object detection.
 
-## 🎯 应用场景
+## 🎯 Application Scenarios
 
-本模型适用于以下应用场景：
+This model is suitable for the following application scenarios:
 
-- **夜间目标检测与追踪**：在低光照或夜间环境下，结合热红外图像提高目标检测准确率
-- **复杂环境监控**：在烟雾、雾霾等能见度低的环境中进行目标识别
-- **自动驾驶**：多模态传感器融合，提升在各种光照和天气条件下的行人和车辆检测
-- **安防监控**：全天候的入侵检测和异常行为识别
-- **搜救任务**：在灾难现场利用热红外特征快速定位生命体征
-- **工业检测**：结合可见光和热红外信息进行设备异常检测和质量控制
-- **医学影像**：多模态医学图像的病灶区域分割
+- **Night Target Detection and Tracking**: Combining thermal infrared images to improve target detection accuracy in low-light or nighttime environments
+- **Complex Environment Monitoring**: Target recognition in low-visibility environments such as smoke and haze
+- **Autonomous Driving**: Multimodal sensor fusion to enhance pedestrian and vehicle detection under various lighting and weather conditions
+- **Security Monitoring**: All-weather intrusion detection and abnormal behavior recognition
+- **Search and Rescue Missions**: Quickly locating vital signs using thermal infrared features at disaster sites
+- **Industrial Inspection**: Equipment anomaly detection and quality control combining visible light and thermal infrared information
+- **Medical Imaging**: Lesion area segmentation in multimodal medical images
 
-## 🏗️ 模型架构
+## 🏗️ Model Architecture
 
-TMSOD采用先进的双分支编码器-解码器架构，主要包含以下核心模块：
+TMSOD adopts an advanced dual-branch encoder-decoder architecture, mainly including the following core modules:
 
-### 核心组件
+### Core Components
 
-1. **双分支编码器 (Dual-Branch Encoder)**
-   - RGB分支：基于Swin Transformer的可见光特征提取
-   - Thermal分支：适配单通道热红外图像的特征提取
-   - 多尺度特征金字塔：提取不同分辨率的语义信息
+1. **Dual-Branch Encoder**
+   - RGB Branch: Swin Transformer-based visible light feature extraction
+   - Thermal Branch: Feature extraction adapted for single-channel thermal infrared images
+   - Multi-scale Feature Pyramid: Extracting semantic information at different resolutions
 
-2. **TPMA: 热物理调制注意力机制**
-   - 物理先验编码：提取热边缘、扩散、惯性和发射率等物理描述子
-   - 物理引导非对称注意力：利用热物理先验增强特征表达
+2. **TPMA: Thermal Physical Modulation Attention**
+   - Physical Prior Encoding: Extracting thermal edge, diffusion, inertia, and emissivity physical descriptors
+   - Physical-Guided Asymmetric Attention: Enhancing feature representation using thermal physical priors
 
-3. **TSM-CWI: 热显著性调制交叉窗口交互**
-   - 显著性感知动态窗口：根据显著性图自适应调整注意力窗口
-   - 语义引导可变形对齐：精确对齐RGB和热红外特征
+3. **TSM-CWI: Thermal Saliency Modulated Cross-Window Interaction**
+   - Saliency-Aware Dynamic Windows: Adaptively adjusting attention windows based on saliency maps
+   - Semantic-Guided Deformable Alignment: Precisely aligning RGB and thermal infrared features
 
-4. **BS-CCD: 边界-语义耦合级联解码器**
-   - 边缘感知跳跃连接融合：预测边缘图并作为注意力净化特征
-   - 语义门控：利用显著性先验重加权解码器特征
-   - 多尺度级联解码：逐步恢复高分辨率显著性图
+4. **BS-CCD: Boundary-Semantic Coupled Cascade Decoder**
+   - Edge-Aware Skip Connection Fusion: Predicting edge maps and using them as attention to purify features
+   - Semantic Gating: Re-weighting decoder features using saliency priors
+   - Multi-scale Cascade Decoding: Progressively recovering high-resolution saliency maps
 
-5. **MOCO: 多目标一致性优化**
-   - 边缘对齐损失：确保边缘预测与最终显著性图一致
-   - 跨模态对齐一致性损失：监督对齐特征质量
+5. **MOCO: Multi-Objective Consistency Optimization**
+   - Edge Alignment Loss: Ensuring consistency between edge predictions and final saliency maps
+   - Cross-Modal Alignment Consistency Loss: Supervising aligned feature quality
 
-### 网络特点
+### Network Features
 
-- ✅ 端到端训练
-- ✅ 支持多GPU并行训练
-- ✅ 混合精度训练（AMP）加速
-- ✅ 物理引导的跨模态特征融合
-- ✅ 边界感知的解码器设计
+- ✅ End-to-end training
+- ✅ Multi-GPU parallel training support
+- ✅ Mixed precision training (AMP) acceleration
+- ✅ Physics-guided cross-modal feature fusion
+- ✅ Boundary-aware decoder design
 
-## 📦 环境依赖
+## 📦 Environment Dependencies
 
 ```bash
 torch>=1.10.0
@@ -63,189 +63,186 @@ tqdm
 timm
 ```
 
-安装依赖：
+Install dependencies:
 ```bash
 pip install torch torchvision numpy Pillow tqdm timm
 ```
 
-## 📁 数据准备
+## 📁 Data Preparation
 
-训练和测试数据应按以下结构组织：
+Training and testing data should be organized as follows:
 
 ```
 dataset/
-├── RGB/                # RGB可见光图像
+├── RGB/                # RGB visible light images
 │   ├── 1.jpg
 │   ├── 2.jpg
 │   └── ...
-├── Thermal/            # 热红外图像
+├── Thermal/            # Thermal infrared images
 │   ├── 1.jpg
 │   ├── 2.jpg
 │   └── ...
-└── GT/                 # 真值标注（仅训练时需要）
+└── GT/                 # Ground truth annotations (required for training only)
     ├── 1.png
     ├── 2.png
     └── ...
 ```
 
-## 🚀 训练模型
+## 🚀 Training the Model
 
-### 1. 配置训练参数
+### 1. Configure Training Parameters
 
-编辑 `train.py` 文件，设置以下路径和参数：
+Edit the `train.py` file and set the following paths and parameters:
 
 ```python
-train_root = '/path/to/RGB/'           # RGB图像路径
-gt_root = '/path/to/GT/'               # 真值标注路径
-thermal_root = '/path/to/Thermal/'     # 热红外图像路径
-save_path = '/path/to/save/checkpoints/'  # 模型保存路径
+train_root = '/path/to/RGB/'           # RGB image path
+gt_root = '/path/to/GT/'               # Ground truth annotation path
+thermal_root = '/path/to/Thermal/'     # Thermal infrared image path
+save_path = '/path/to/save/checkpoints/'  # Model save path
 
-trainsize = 384        # 训练图像尺寸
-batchsize = 8          # 批次大小
-base_lr = 1e-5         # 基础学习率
-num_epochs = 200       # 训练轮数
+trainsize = 384        # Training image size
+batchsize = 8          # Batch size
+base_lr = 1e-5         # Base learning rate
+num_epochs = 200       # Number of epochs
 ```
 
-### 2. 下载预训练权重
+### 2. Download Pre-trained Weights
 
-下载Swin Transformer预训练权重：
+Download Swin Transformer pre-trained weights:
 ```bash
-# 下载 swin_base_patch4_window12_384_22k.pth
-# 放置在项目根目录
+# Download swin_base_patch4_window12_384_22k.pth
+# Place in the project root directory
 ```
 
-### 3. 开始训练
+### 3. Start Training
 
 ```bash
 python train.py
 ```
 
-**训练特性：**
-- 自动检测并使用多GPU（如果可用）
-- 混合精度训练加速
-- 余弦退火学习率调度
-- 自动保存训练日志（CSV格式）
-- 每个epoch保存模型检查点
-- 实时显示训练损失、验证指标（MAE、F-measure、S-measure、E-measure）
+**Training Features:**
+- Automatic detection and use of multiple GPUs (if available)
+- Mixed precision training acceleration
+- Cosine annealing learning rate scheduling
+- Automatic saving of training logs (CSV format)
+- Model checkpoint saving every epoch
+- Real-time display of training loss, validation metrics (MAE, F-measure, S-measure, E-measure)
 
-### 4. 训练输出
+### 4. Training Output
 
-训练过程中会生成：
-- `best_model_{epoch}.pth`：每个epoch的模型权重
-- `training_log_1.csv`：详细的训练日志
+During training, the following will be generated:
+- `best_model_{epoch}.pth`: Model weights for each epoch
+- `training_log_1.csv`: Detailed training logs
 
-训练日志包含：
-- Epoch编号
-- 训练损失
-- 验证损失
-- MAE（平均绝对误差）
-- F-measure（F值）
-- S-measure（结构相似度）
-- E-measure（增强对齐度）
-- 一致性损失
+Training logs include:
+- Epoch number
+- Training loss
+- Validation loss
+- MAE (Mean Absolute Error)
+- F-measure (F-score)
+- S-measure (Structural Similarity)
+- E-measure (Enhanced Alignment)
+- Consistency loss
 
-## 🔍 测试模型
+## 🔍 Testing the Model
 
-### 1. 配置测试参数
+### 1. Configure Test Parameters
 
-编辑 `test.py` 文件，设置以下参数：
+Edit the `test.py` file and set the following parameters:
 
 ```python
-RGB_ROOT = '/path/to/test/RGB/'        # 测试RGB图像路径
-THERMAL_ROOT = '/path/to/test/Thermal/'  # 测试热红外图像路径
-WEIGHTS_PATH = '/path/to/best_model.pth'  # 训练好的模型权重
-SAVE_DIR = '/path/to/save/results/'    # 预测结果保存路径
+RGB_ROOT = '/path/to/test/RGB/'        # Test RGB image path
+THERMAL_ROOT = '/path/to/test/Thermal/'  # Test thermal infrared image path
+WEIGHTS_PATH = '/path/to/best_model.pth'  # Trained model weights
+SAVE_DIR = '/path/to/save/results/'    # Prediction result save path
 
-TEST_SIZE = 384        # 测试图像尺寸
-THRESHOLD = 0.5        # 二值化阈值
+TEST_SIZE = 384        # Test image size
+THRESHOLD = 0.5        # Binarization threshold
 ```
 
-### 2. 运行推理
+### 2. Run Inference
 
 ```bash
 python test.py
 ```
 
-### 3. 输出结果
+### 3. Output Results
 
-- 预测的显著性图将保存为PNG格式（0-255灰度图）
-- 文件命名格式：`1.png`, `2.png`, ...
-- 终端显示推理进度和完成信息
+- Predicted saliency maps will be saved in PNG format (0-255 grayscale)
+- File naming format: `1.png`, `2.png`, ...
+- Terminal displays inference progress and completion information
 
-## 📊 模型性能
+## 📊 Model Performance
 
-模型在RGB-T显著目标检测数据集上的表现：
+Model performance on RGB-T salient object detection datasets:
 
-- **MAE (Mean Absolute Error)**：越低越好
-- **F-measure**：综合考虑精确率和召回率
-- **S-measure**：结构相似度度量
-- **E-measure**：增强对齐度度量
+- **MAE (Mean Absolute Error)**: Lower is better
+- **F-measure**: Comprehensive consideration of precision and recall
+- **S-measure**: Structural similarity measure
+- **E-measure**: Enhanced alignment measure
 
-具体性能指标请参考训练日志文件。
+Please refer to the training log files for specific performance metrics.
 
-## 🔧 高级用法
+## 🔧 Advanced Usage
 
-### 多GPU训练
+### Multi-GPU Training
 
-模型会自动检测可用GPU数量：
-- 2个或以上GPU：自动启用DataParallel并行训练
-- 1个GPU：单GPU训练
-- 无GPU：CPU训练（不推荐，速度慢）
+The model automatically detects the number of available GPUs:
+- 2 or more GPUs: Automatically enables DataParallel training
+- 1 GPU: Single GPU training
+- No GPU: CPU training (not recommended, slow)
 
-### 自定义窗口大小
+### Custom Window Size
 
-在训练或测试前可以调整TSM-CWI模块的窗口大小：
+Window size of TSM-CWI module can be adjusted before training or testing:
 
 ```python
-# 在train.py或test.py中
-model.MSA4_r.window_size2 = 4  # 调整RGB分支窗口
-model.MSA4_t.window_size2 = 4  # 调整Thermal分支窗口
+# In train.py or test.py
+model.MSA4_r.window_size2 = 4  # Adjust RGB branch window
+model.MSA4_t.window_size2 = 4  # Adjust Thermal branch window
 ```
 
-### 损失函数权重调整
+### Loss Function Weight Adjustment
 
-在 `train.py` 中可以调整不同损失的权重：
+Different loss weights can be adjusted in `train.py`:
 
 ```python
-# 主损失
+# Main loss
 criterion = CombinedLoss(weight_dice=0.5, weight_bce=0.5)
 
-# 一致性损失权重
-total_loss = loss + 0.1 * consistency_loss  # 0.1为一致性损失权重
+# Consistency loss weight
+total_loss = loss + 0.1 * consistency_loss  # 0.1 is the consistency loss weight
 ```
 
-## 📝 注意事项
+## 📝 Notes
 
-1. **内存要求**：建议使用至少16GB显存的GPU进行训练（batchsize=8）
-2. **图像配对**：确保RGB和Thermal图像严格配对且数量一致
-3. **图像格式**：支持`.jpg`和`.png`格式
-4. **热红外图像**：模型接受单通道灰度热红外图像
-5. **数值稳定性**：训练时已设置随机种子（seed=42）保证可复现性
+1. **Memory Requirements**: It is recommended to use a GPU with at least 16GB VRAM for training (batchsize=8)
+2. **Image Pairing**: Ensure RGB and Thermal images are strictly paired and have the same quantity
+3. **Image Format**: Supports `.jpg` and `.png` formats
+4. **Thermal Infrared Images**: Model accepts single-channel grayscale thermal infrared images
+5. **Numerical Stability**: Random seed (seed=42) is set during training to ensure reproducibility
 
-## 🐛 常见问题
+## 🐛 Common Issues
 
-**Q: 训练时显存不足怎么办？**  
-A: 减小`batchsize`参数，例如从8改为4或2。
+**Q: Out of memory during training?**  
+A: Reduce the `batchsize` parameter, for example, from 8 to 4 or 2.
 
-**Q: RGB和Thermal图像数量不匹配？**  
-A: 检查数据集，确保两个文件夹中的图像按相同顺序命名且数量一致。
+**Q: RGB and Thermal image counts don't match?**  
+A: Check the dataset to ensure images in both folders are named in the same order and have the same quantity.
 
-**Q: 找不到预训练权重？**  
-A: 下载`swin_base_patch4_window12_384_22k.pth`并放在项目根目录，或在代码中修改路径。
+**Q: Cannot find pre-trained weights?**  
+A: Download `swin_base_patch4_window12_384_22k.pth` and place it in the project root directory, or modify the path in the code.
 
-**Q: 测试结果全黑或全白？**  
-A: 调整`test.py`中的`THRESHOLD`参数（默认0.5），尝试0.3-0.7之间的值。
+**Q: Test results are all black or all white?**  
+A: Adjust the `THRESHOLD` parameter in `test.py` (default 0.5), try values between 0.3-0.7.
 
-## 📄 引用
+## 📄 Citation
 
-如果本模型对您的研究有帮助，欢迎引用相关工作。
+If this model is helpful for your research, please cite the related work.
 
-## 📧 联系方式
+## 📧 Contact
 
-如有问题或建议，欢迎提出Issue或Pull Request。
+If you have any questions or suggestions, please feel free to submit an Issue or Pull Request.
 
-作者联系方式：amdusia@outlook.com
+Author contact: amdusia@outlook.com
 ---
-
-**祝您使用愉快！** 🎉
-
