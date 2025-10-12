@@ -1,8 +1,8 @@
-# TMSOD: Thermal-Visible Multimodal Salient Object Detection Network
+# ABCNet: Thermal-Visible Multimodal Salient Object Detection Network
 
 ## 📋 Model Introduction
 
-TMSOD (Thermo-Modal Salient Object Detection) is a deep learning-based dual-modal salient object detection model specifically designed to fuse RGB visible light images and thermal infrared images for accurate salient object detection.
+ABCNet (Thermo-Modal Salient Object Detection) is a deep learning-based dual-modal salient object detection model specifically designed to fuse RGB visible light images and thermal infrared images for accurate salient object detection.
 
 ## 🎯 Application Scenarios
 
@@ -18,7 +18,7 @@ This model is suitable for the following application scenarios:
 
 ## 🏗️ Model Architecture
 
-TMSOD adopts an advanced dual-branch encoder-decoder architecture, mainly including the following core modules:
+ABCNet adopts an advanced dual-branch encoder-decoder architecture, mainly including the following core modules:
 
 ### Core Components
 
