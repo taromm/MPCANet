@@ -1,8 +1,8 @@
-# ABCNet: Thermal-Visible Multimodal Salient Object Detection Network
+# MPCANet: Multi-Physical Prior Guided Cross-Modal Attention Network for RGB-T Salient Object Detection
 
 ## 📋 Model Introduction
 
-ABCNet (Thermo-Modal Salient Object Detection) is a deep learning-based dual-modal salient object detection model specifically designed to fuse RGB visible light images and thermal infrared images for accurate salient object detection.
+MPCANet (Multi-Physical Prior Guided Cross-Modal Attention Network) is a deep learning-based dual-modal salient object detection model specifically designed to fuse RGB visible light images and thermal infrared images for accurate salient object detection.
 
 ## 🎯 Application Scenarios
 
@@ -18,7 +18,7 @@ This model is suitable for the following application scenarios:
 
 ## 🏗️ Model Architecture
 
-ABCNet adopts an advanced dual-branch encoder-decoder architecture, mainly including the following core modules:
+MPCANet adopts an advanced dual-branch encoder-decoder architecture, mainly including the following core modules:
 
 ### Core Components
 
