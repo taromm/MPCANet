@@ -1,20 +1,12 @@
 # MPCANet: Multi-Physical Prior Guided Cross-Modal Attention Network for RGB-T Salient Object Detection
 
+## Abstract
+
+RGB-T salient object detection (SOD) fuses the fine details of RGB with the robustness of thermal infrared (TIR) to segment salient objects across diverse scenes and lighting conditions. However, existing approaches face three main challenges: (i) thermal noise and registration errors contaminate attention at early fusion, (ii) cross-modal misalignment and detail preservation are difficult to balance, and (iii) thermophysical properties (e.g., heat diffusion and inertia) are under-modeled, leading to instability in low-contrast and dynamic settings. Thermophysical priors could provide interpretable cues on boundaries, diffusion, inertia, and material differences, suppressing noise at the source and strengthening structural reliability. When combined with high-level semantics that provide global task relevance and region-level attention, interaction is reinforced only in semantically relevant and physically reliable areas. Building on this principle, we propose a semantics–physics integrated cross-modal framework. The key idea is to inject thermophysical priors into attention logits before normalization to suppress upstream thermal noise, while semantic saliency dynamically controls the receptive field and sampling for bi-directional alignment, balancing global consistency with local sharpness. During decoding process, a boundary–semantic coupling restores fine structures. Extensive experiments on public benchmarks demonstrate state-of-the-art performance with sharper boundaries and more coherent regions.
+
 ## 📋 Model Introduction
 
 MPCANet (Multi-Physical Prior Guided Cross-Modal Attention Network) is a deep learning-based dual-modal salient object detection model specifically designed to fuse RGB visible light images and thermal infrared images for accurate salient object detection.
-
-## 🎯 Application Scenarios
-
-This model is suitable for the following application scenarios:
-
-- **Night Target Detection and Tracking**: Combining thermal infrared images to improve target detection accuracy in low-light or nighttime environments
-- **Complex Environment Monitoring**: Target recognition in low-visibility environments such as smoke and haze
-- **Autonomous Driving**: Multimodal sensor fusion to enhance pedestrian and vehicle detection under various lighting and weather conditions
-- **Security Monitoring**: All-weather intrusion detection and abnormal behavior recognition
-- **Search and Rescue Missions**: Quickly locating vital signs using thermal infrared features at disaster sites
-- **Industrial Inspection**: Equipment anomaly detection and quality control combining visible light and thermal infrared information
-- **Medical Imaging**: Lesion area segmentation in multimodal medical images
 
 ## 🏗️ Model Architecture
 
@@ -40,9 +32,6 @@ MPCANet adopts an advanced dual-branch encoder-decoder architecture, mainly incl
    - Semantic Gating: Re-weighting decoder features using saliency priors
    - Multi-scale Cascade Decoding: Progressively recovering high-resolution saliency maps
 
-5. **MOCO: Multi-Objective Consistency Optimization**
-   - Edge Alignment Loss: Ensuring consistency between edge predictions and final saliency maps
-   - Cross-Modal Alignment Consistency Loss: Supervising aligned feature quality
 
 ### Network Features
 
@@ -90,35 +79,23 @@ dataset/
 
 ## 🚀 Training the Model
 
-### 1. Configure Training Parameters
+1. **Configure paths** in `train.py`:
+   ```python
+   train_root = '/path/to/RGB/'           # RGB images
+   gt_root = '/path/to/GT/'               # Ground truth
+   thermal_root = '/path/to/Thermal/'     # Thermal images
+   save_path = '/path/to/save/checkpoints/'
+   ```
 
-Edit the `train.py` file and set the following paths and parameters:
+2. **Download pre-trained weights**:
+   ```bash
+   # Download swin_base_patch4_window12_384_22k.pth to project root
+   ```
 
-```python
-train_root = '/path/to/RGB/'           # RGB image path
-gt_root = '/path/to/GT/'               # Ground truth annotation path
-thermal_root = '/path/to/Thermal/'     # Thermal infrared image path
-save_path = '/path/to/save/checkpoints/'  # Model save path
-
-trainsize = 384        # Training image size
-batchsize = 8          # Batch size
-base_lr = 1e-5         # Base learning rate
-num_epochs = 200       # Number of epochs
-```
-
-### 2. Download Pre-trained Weights
-
-Download Swin Transformer pre-trained weights:
-```bash
-# Download swin_base_patch4_window12_384_22k.pth
-# Place in the project root directory
-```
-
-### 3. Start Training
-
-```bash
-python train.py
-```
+3. **Start training**:
+   ```bash
+   python train.py
+   ```
 
 **Training Features:**
 - Automatic detection and use of multiple GPUs (if available)
@@ -142,7 +119,6 @@ Training logs include:
 - F-measure (F-score)
 - S-measure (Structural Similarity)
 - E-measure (Enhanced Alignment)
-- Consistency loss
 
 ## 🔍 Testing the Model
 
@@ -210,8 +186,6 @@ Different loss weights can be adjusted in `train.py`:
 # Main loss
 criterion = CombinedLoss(weight_dice=0.5, weight_bce=0.5)
 
-# Consistency loss weight
-total_loss = loss + 0.1 * consistency_loss  # 0.1 is the consistency loss weight
 ```
 
 ## 📝 Notes
