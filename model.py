@@ -138,11 +138,12 @@ class TMSOD(nn.Module):
         self.convAtt2 = conv3x3_bn_relu(256*2, 256)
 
         # BS-CCD: Edge-Aware Skip Fusion (Sec. 3.4.1, Eq. 241-248)
-        # Shared EdgeHead as described in text.txt line 243
-        # Use higher dilation for high-resolution stages (mentioned after Eq. 241)
-        self.edge_head = EdgeHead(in_dim=1024, dilation=1)  # Stage 4 (deepest)
-        self.edge_head_highres = EdgeHead(in_dim=512, dilation=2)  # Stage 3
-        self.edge_head_finest = EdgeHead(in_dim=256, dilation=3)  # Stage 2 & 1 (finest)
+        # Use one shared EdgeHead; unify stage inputs via 1x1 pre-projection
+        self.edge_head = EdgeHead(in_dim=256, dilation=1)
+        self.edge_preproj_4 = nn.Conv2d(1024 + 1024, 256, kernel_size=1)
+        self.edge_preproj_3 = nn.Conv2d(512 + 512, 256, kernel_size=1)
+        self.edge_preproj_2 = nn.Conv2d(256 + 256, 256, kernel_size=1)
+        self.edge_preproj_1 = nn.Conv2d(128 + 128, 256, kernel_size=1)
 
         self.shallow_fusion = nn.Sequential(
             nn.Conv2d(128 + 128, 128, kernel_size=3, padding=1),
@@ -155,7 +156,7 @@ class TMSOD(nn.Module):
         )
 
         self.decode4 = nn.Sequential(
-            nn.Conv2d(1024, 512, 3, padding=1),
+            nn.Conv2d(256, 512, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(512, 512, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -163,7 +164,7 @@ class TMSOD(nn.Module):
         )
 
         self.decode3 = nn.Sequential(
-            nn.Conv2d(512 + 512, 256, 3, padding=1),
+            nn.Conv2d(256, 256, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 256, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -171,7 +172,7 @@ class TMSOD(nn.Module):
         )
 
         self.decode2 = nn.Sequential(
-            nn.Conv2d(256 + 256, 128, 3, padding=1),
+            nn.Conv2d(256, 128, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 128, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -179,7 +180,7 @@ class TMSOD(nn.Module):
         )
 
         self.decode1 = nn.Sequential(
-            nn.Conv2d(128 + 128, 64, 3, padding=1),
+            nn.Conv2d(256, 64, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -213,6 +214,16 @@ class TMSOD(nn.Module):
         
         # Semantic Gating parameter (Eq. 256: A_sem = 1 + gamma_dec * Norm(p))
         self.gamma_dec = nn.Parameter(torch.tensor(0.1))
+
+        # Stage saliency heads for decoder guidance (Sec. 3.4 Semantic Gating)
+        self.sal_head4 = nn.Conv2d(512, 1, kernel_size=1)
+        self.sal_head3 = nn.Conv2d(256, 1, kernel_size=1)
+        self.sal_head2 = nn.Conv2d(128, 1, kernel_size=1)
+
+    def _norm_minmax(self, x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        x_min = x.amin(dim=(2, 3), keepdim=True)
+        x_max = x.amax(dim=(2, 3), keepdim=True)
+        return (x - x_min) / (x_max - x_min + eps)
         
     def forward(self, rgb, t):
         """
@@ -290,7 +301,7 @@ class TMSOD(nn.Module):
         att_4_r = self.MSA4_r(fr[3].flatten(2).transpose(1, 2),
                               ft[3].flatten(2).transpose(1, 2),
                               semantic=semantic,
-                              P_thermal=P_thermal_1024,
+                              P_thermal=P_thermal_1024,  # asymmetric: inject only when querying TIR
                               p_saliency = p_saliency,
                               alpha = 4,
                               threshold_sal = 0.3
@@ -299,7 +310,7 @@ class TMSOD(nn.Module):
         att_4_t = self.MSA4_t(ft[3].flatten(2).transpose(1, 2),
                               fr[3].flatten(2).transpose(1, 2),
                               semantic=semantic,
-                              P_thermal=P_thermal_1024, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
+                              P_thermal=None, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
 
         # Layer 3 (512-dim)
         att_3_r = self.MSA3_r(fr[2].flatten(2).transpose(1, 2),
@@ -310,7 +321,7 @@ class TMSOD(nn.Module):
         att_3_t = self.MSA3_t(ft[2].flatten(2).transpose(1, 2),
                               fr[2].flatten(2).transpose(1, 2),
                               semantic=semantic,
-                              P_thermal=P_thermal_512, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
+                              P_thermal=None, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
 
         # Layer 2 (256-dim)
         att_2_r = self.MSA2_r(fr[1].flatten(2).transpose(1, 2),
@@ -321,14 +332,9 @@ class TMSOD(nn.Module):
         att_2_t = self.MSA2_t(ft[1].flatten(2).transpose(1, 2),
                               fr[1].flatten(2).transpose(1, 2),
                               semantic=semantic,
-                              P_thermal=P_thermal_256, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
+                              P_thermal=None, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
 
-        r1 = self.shallow_fusion(torch.cat([fr[0], ft[0]], dim=1))
-        from canny_morph_gradient import process_tensor_to_edge_single_channel,show_edge_detection_result
-        edge_result = show_edge_detection_result(
-            rgb,
-            r1
-        )
+        f1 = self.shallow_fusion(torch.cat([fr[0], ft[0]], dim=1))
 
         # Reshape attention outputs back to spatial format
         r4 = att_4_r.view(att_4_r.shape[0], fr[3].shape[2], fr[3].shape[3], -1).permute(0, 3, 1, 2).contiguous()
@@ -345,7 +351,7 @@ class TMSOD(nn.Module):
         # Eq. (149-150): Semantic gating of Value and deformable sampling
         # Eq. (165-171): Bidirectional cross-modal representations Z_r^l, Z_t^l
         F_final4, feat_r2t4, feat_t2r4 = self.align_att4(
-            r4, t4, thermal_mask=p_saliency_4
+            r4, t4, thermal_mask=p_saliency_4, value_gate=p_saliency_4
         )
 
         # Store features for consistency loss (Eq. 349-354)
@@ -368,7 +374,7 @@ class TMSOD(nn.Module):
 
         # Deformable alignment with semantic guidance (Eq. 146-162)
         F_final3, feat_r2t3, feat_t2r3 = self.align_att3(
-            r3, t3, thermal_mask=p_saliency_3
+            r3, t3, thermal_mask=p_saliency_3, value_gate=p_saliency_3
         )
 
         # Store for consistency loss
@@ -390,7 +396,7 @@ class TMSOD(nn.Module):
 
         # Deformable alignment with semantic guidance (Eq. 146-162)
         F_final2, feat_r2t2, feat_t2r2 = self.align_att2(
-            r2, t2, thermal_mask=p_saliency_2
+            r2, t2, thermal_mask=p_saliency_2, value_gate=p_saliency_2
         )
 
         # Store for consistency loss
@@ -402,58 +408,121 @@ class TMSOD(nn.Module):
         r2 = self.convAtt2(torch.cat((r2, F_final2), dim=1))
 
         # BS-CCD Decoder (Sec. 3.4 in text.txt)
-        # Stage 4: deepest stage
-        r4_up = self.up2(r4)
-        # Eq. (236): U_l = [Up(F_l), X_r^l] 
-        # Here we apply EdgeHead to concatenated upsampled features
-        edge_map_4, r4_edge_refined = self.edge_head(r4_up)
-        r4 = self.decode4(r4_edge_refined)
-        
-        # Eq. (256): Semantic Gating A_sem = 1 + gamma_dec * Norm(p)
-        p_saliency_norm_4 = F.normalize(p_saliency_4, dim=(2,3))
+        # Stage 4 (top): U4 = [F4, X_r^4]
+        U4 = torch.cat([r4, fr[3]], dim=1)
+        U4p = self.edge_preproj_4(U4)
+        edge_map_4, U4_refined = self.edge_head(U4p)
+        r4_dec = self.decode4(U4_refined)
+        # Guidance uses encoder prior at top stage
+        p_saliency_norm_4 = self._norm_minmax(p_saliency_4)
         A_sem_4 = 1 + self.gamma_dec * p_saliency_norm_4
-        r4 = r4 * A_sem_4  # Eq. (260): reweighted features
+        r4_g = r4_dec * A_sem_4
+        pred4 = self.sal_head4(r4_g)
 
-        # Stage 3
-        r3 = torch.cat([r3, r4], dim=1)
-        r3 = self.up2(r3)
-        edge_map_3, r3_edge_refined = self.edge_head_highres(r3)
-        r3 = self.decode3(r3_edge_refined)
-        
-        p_saliency_norm_3 = F.normalize(p_saliency_3, dim=(2,3))
-        A_sem_3 = 1 + self.gamma_dec * p_saliency_norm_3
-        r3 = r3 * A_sem_3
+        # Stage 3: U3 = [F3, X_r^3]
+        U3 = torch.cat([r3, fr[2]], dim=1)
+        U3p = self.edge_preproj_3(U3)
+        edge_map_3, U3_refined = self.edge_head(U3p)
+        r3_dec = self.decode3(U3_refined)
+        p_guidance_3 = F.interpolate(torch.sigmoid(pred4), size=(r3_dec.shape[2], r3_dec.shape[3]), mode='bilinear', align_corners=False)
+        A_sem_3 = 1 + self.gamma_dec * self._norm_minmax(p_guidance_3)
+        r3_g = r3_dec * A_sem_3
+        pred3 = self.sal_head3(r3_g)
 
-        # Stage 2
-        r2 = torch.cat([r2, r3], dim=1)
-        r2 = self.up2(r2)
-        edge_map_2, r2_edge_refined = self.edge_head_highres(r2)
-        r2 = self.decode2(r2_edge_refined)
-        
-        p_saliency_norm_2 = F.normalize(p_saliency_2, dim=(2,3))
-        A_sem_2 = 1 + self.gamma_dec * p_saliency_norm_2
-        r2 = r2 * A_sem_2
+        # Stage 2: U2 = [F2, X_r^2]
+        U2 = torch.cat([r2, fr[1]], dim=1)
+        U2p = self.edge_preproj_2(U2)
+        edge_map_2, U2_refined = self.edge_head(U2p)
+        r2_dec = self.decode2(U2_refined)
+        p_guidance_2 = F.interpolate(torch.sigmoid(pred3), size=(r2_dec.shape[2], r2_dec.shape[3]), mode='bilinear', align_corners=False)
+        A_sem_2 = 1 + self.gamma_dec * self._norm_minmax(p_guidance_2)
+        r2_g = r2_dec * A_sem_2
 
-        # Stage 1: finest stage
-        r1 = torch.cat([r1, r2], dim=1)
-        edge_map_1, r1_edge_refined = self.edge_head_finest(r1)
-        r1 = self.decode1(r1_edge_refined)
-        
-        p_saliency_1 = F.interpolate(
-            p_saliency, size=(r1.shape[2], r1.shape[3]),
-            mode='bilinear', align_corners=False
-        )
-        p_saliency_norm_1 = F.normalize(p_saliency_1, dim=(2,3))
-        A_sem_1 = 1 + self.gamma_dec * p_saliency_norm_1
-        r1 = r1 * A_sem_1
+        # Stage 1: U1 = [F1, X_r^1]
+        U1 = torch.cat([f1, fr[0]], dim=1)
+        U1p = self.edge_preproj_1(U1)
+        edge_map_1, U1_refined = self.edge_head(U1p)
+        r1_dec = self.decode1(U1_refined)
+        p_guidance_1 = F.interpolate(torch.sigmoid(self.sal_head2(r2_g)), size=(r1_dec.shape[2], r1_dec.shape[3]), mode='bilinear', align_corners=False)
+        A_sem_1 = 1 + self.gamma_dec * self._norm_minmax(p_guidance_1)
+        r1_g = r1_dec * A_sem_1
 
-        out = self.up4(r1)
+        out = self.up4(r1_g)
         out = self.conv64(out)
         
         # Store edge maps for edge alignment loss (Eq. 341-343 in text.txt)
         self.edge_maps = [edge_map_1, edge_map_2, edge_map_3, edge_map_4]
         
         return out, p_saliency, P_thermal
+
+    # ===== Loss utilities (Sec. 3.5) =====
+    @staticmethod
+    def _sigmoid_smooth(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        return torch.clamp(x, eps, 1.0 - eps)
+
+    def loss_bce(self, pred_prob: torch.Tensor, gt_mask: torch.Tensor) -> torch.Tensor:
+        """Binary cross-entropy over probabilities."""
+        pred_prob = self._sigmoid_smooth(pred_prob)
+        return F.binary_cross_entropy(pred_prob, gt_mask)
+
+    def loss_dice(self, pred_prob: torch.Tensor, gt_mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """Dice loss (1 - Dice)."""
+        pred_prob = self._sigmoid_smooth(pred_prob)
+        intersection = (pred_prob * gt_mask).sum(dim=(1, 2, 3))
+        union = pred_prob.sum(dim=(1, 2, 3)) + gt_mask.sum(dim=(1, 2, 3))
+        dice = (2.0 * intersection + eps) / (union + eps)
+        return 1.0 - dice.mean()
+
+    @staticmethod
+    def _sobel_kernels(device, dtype):
+        kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=dtype, device=device).view(1, 1, 3, 3)
+        ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=dtype, device=device).view(1, 1, 3, 3)
+        return kx, ky
+
+    def loss_smooth(self, pred_prob: torch.Tensor, gt_mask: torch.Tensor, alpha: float = 1.0, eps: float = 1e-3) -> torch.Tensor:
+        """Structure-preserving smoothness with Charbonnier penalty weighted by GT edges.
+        L_smooth = E[ rho(e^{-alpha|∇Y|}|∇S|) ]
+        """
+        pred_prob = self._sigmoid_smooth(pred_prob)
+        device = pred_prob.device
+        dtype = pred_prob.dtype
+        kx, ky = self._sobel_kernels(device, dtype)
+        # gradients
+        gx_pred = F.conv2d(pred_prob, kx, padding=1)
+        gy_pred = F.conv2d(pred_prob, ky, padding=1)
+        gx_gt = F.conv2d(gt_mask, kx, padding=1)
+        gy_gt = F.conv2d(gt_mask, ky, padding=1)
+        w_x = torch.exp(-alpha * torch.abs(gx_gt))
+        w_y = torch.exp(-alpha * torch.abs(gy_gt))
+        pen_x = torch.sqrt((w_x * torch.abs(gx_pred)) ** 2 + eps ** 2)
+        pen_y = torch.sqrt((w_y * torch.abs(gy_pred)) ** 2 + eps ** 2)
+        return (pen_x.mean() + pen_y.mean()) * 0.5
+
+    def moct_loss(
+        self,
+        pred_logit: torch.Tensor,
+        gt_mask: torch.Tensor,
+        gt_edge: torch.Tensor,
+        lambda_bce: float = 0.5,
+        lambda_dice: float = 0.5,
+        lambda_sm: float = 0.8,
+        lambda_edge: float = 0.5,
+        lambda_cons: float = 0.1,
+    ) -> torch.Tensor:
+        """Aggregate MOCT loss per Sec. 3.5 Eq.(292-295)."""
+        pred_prob = torch.sigmoid(pred_logit)
+        l_bce = self.loss_bce(pred_prob, gt_mask)
+        l_dice = self.loss_dice(pred_prob, gt_mask)
+        l_sm = self.loss_smooth(pred_prob, gt_mask)
+        l_edge = self.edge_alignment_loss(pred_prob, gt_edge)
+        l_cons = self.consistency_loss()
+        return (
+            lambda_bce * l_bce
+            + lambda_dice * l_dice
+            + lambda_sm * l_sm
+            + lambda_edge * l_edge
+            + lambda_cons * l_cons
+        )
 
     def load_pre(self, pre_model):
         state_dict = torch.load(pre_model)['model']
@@ -648,13 +717,21 @@ class get_aligned_feat(nn.Module):
 
         self.beta = nn.Parameter(torch.tensor(0.0))
 
-    def forward(self, fr, ft, thermal_mask=None):
+        # Semantic gating strength for Value (Eq. 156)
+        self.gamma_sem = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, fr, ft, thermal_mask=None, value_gate=None):
         cat_feat = torch.cat((fr, ft), dim=1)
         feat1 = self.deformConv1(cat_feat)
         feat2 = self.deformConv2(feat1)
         feat3 = self.deformConv3(feat2)
 
-        aligned_feat_r2t = self.deformConv4_r2t(feat3, ft)
+        # Semantic gating of Value for both directions
+        if value_gate is not None:
+            gate = 1.0 + self.gamma_sem * value_gate
+            ft = ft * gate
+            fr = fr * gate
+        aligned_feat_r2t = self.deformConv4_r2t(feat3, ft, thermal_mask=thermal_mask, beta=self.beta)
 
         aligned_feat_t2r = self.deformConv4_t2r(
             feta3 = feat3,
