@@ -14,8 +14,13 @@ class ThermalPhysicsPrior(nn.Module):
         self.diffusion_steps = diffusion_steps
         self.alpha = alpha
         self.gaussian_blur = GaussianBlur(kernel_size=5, sigma=2.0)
+        # Calculate total channels: 1 (edge) + 1 (diffusion) + 1 (inertia) + N (emissivity)
+        # Emissivity prior has 4 scales * 8 orientations = 32 channels
+        emissivity_channels = 4 * 8  # scales * orientations
+        total_prior_channels = 1 + 1 + 1 + emissivity_channels  # 35 channels
+        
         self.channel_alignment = nn.Sequential(
-            nn.Conv2d(2, 64, kernel_size=3, padding=1),
+            nn.Conv2d(total_prior_channels, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
@@ -84,49 +89,108 @@ class ThermalPhysicsPrior(nn.Module):
         
         return log_kernel
 
-    def compute_pseudo_time_inertia_map(self, thermal_image, steps: int = 7, sigma0: float = 0.6, growth: float = 1.35, weight_decay: float = 0.85):
+    def compute_thermal_inertia_prior(self, thermal_image, steps: int = 7, sigma: float = 1.0):
+        """
+        Thermal Inertia Prior (P_i) as per Eq. (31-33):
+        P_i = ∑_{s=0}^{S-1} |I_t^{(s+1)} - I_t^{(s)}|
+        where I_t^{(s+1)} = G_σ * I_t^{(s)}
+        """
         T = thermal_image.float()
         
+        # Initialize the sequence: I_t^{(0)} = I_t
+        I_s = T.clone()
         accum = torch.zeros_like(T, dtype=torch.float32)
         
-        for k in range(steps):
-            sigma = sigma0 * (growth ** k)
+        # Create Gaussian kernel for diffusion
+        kernel_size = max(3, int(2 * round(sigma) + 1)) | 1
+        gaussian_blur = GaussianBlur(kernel_size=kernel_size, sigma=sigma)
+        
+        # Iterative sequence as per formula
+        for s in range(steps):
+            # I_t^{(s+1)} = G_σ * I_t^{(s)}
+            I_s_next = gaussian_blur(I_s)
             
-            kernel_size = max(3, int(2 * round(sigma) + 1)) | 1
-            gaussian_blur = GaussianBlur(kernel_size=kernel_size, sigma=sigma)
-            Tk = gaussian_blur(T)
+            # |I_t^{(s+1)} - I_t^{(s)}|
+            diff = torch.abs(I_s_next - I_s)
+            accum += diff
             
-            w = weight_decay ** k
-            
-            accum += w * torch.abs(T - Tk)
+            # Update I_s for next iteration
+            I_s = I_s_next
         
         inertia = self._normalize01(accum)
-        
         return inertia
 
-    def compute_alpha_energy(self, thermal_image, scales: Tuple[int, ...] = (3, 5, 9, 15), orientations: int = 8):
+    def compute_emissivity_prior(self, thermal_image, scales: Tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), orientations: int = 8):
+        """
+        Emissivity Prior (P_a) as per Eq. (37-39):
+        P_a = Concat[F^{-1}(H_b · F(I_t))]_{b=1}^B
+        where H_b is log-Gabor filter bank
+        """
         T = thermal_image.float()
+        B, C, H, W = T.shape
         
-        responses = self._compute_gabor_responses(T, scales, orientations)
+        # Convert to frequency domain: F(I_t)
+        F_thermal = torch.fft.fft2(T, dim=(-2, -1))
+        F_thermal = torch.fft.fftshift(F_thermal, dim=(-2, -1))
         
-        stack = torch.stack(responses, dim=0)
-        alpha_energy = torch.mean(stack, dim=0)
+        responses = []
         
-        alpha_energy = self._normalize01(alpha_energy)
+        # Create log-Gabor filter bank
+        for scale in scales:
+            for oi in range(orientations):
+                theta = (torch.pi * oi) / orientations
+                
+                # Create log-Gabor filter in frequency domain
+                H_b = self._create_log_gabor_frequency_filter(H, W, scale, theta, device=T.device)
+                
+                # Apply filter: H_b · F(I_t)
+                filtered = H_b * F_thermal
+                
+                # Convert back to spatial domain: F^{-1}(H_b · F(I_t))
+                filtered = torch.fft.ifftshift(filtered, dim=(-2, -1))
+                response = torch.fft.ifft2(filtered, dim=(-2, -1))
+                
+                # Take magnitude and add to responses
+                responses.append(torch.abs(response))
         
-        return alpha_energy
+        # Concatenate all responses as per formula
+        emissivity_prior = torch.cat(responses, dim=1)
+        
+        return emissivity_prior
 
-    def compute_alpha_diff(self, thermal_image, scales: Tuple[int, ...] = (3, 5, 9, 15), orientations: int = 8):
-        T = thermal_image.float()
+    def _create_log_gabor_frequency_filter(self, H: int, W: int, scale: float, theta: float, device: torch.device):
+        """
+        Create log-Gabor filter in frequency domain
+        """
+        # Create frequency grids
+        u = torch.arange(-W//2, W//2, dtype=torch.float32, device=device)
+        v = torch.arange(-H//2, H//2, dtype=torch.float32, device=device)
+        U, V = torch.meshgrid(u, v, indexing='ij')
         
-        responses = self._compute_gabor_responses(T, scales, orientations)
+        # Convert to polar coordinates
+        R = torch.sqrt(U**2 + V**2)
+        Phi = torch.atan2(V, U)
         
-        stack = torch.stack(responses, dim=0)
-        alpha_diff = torch.std(stack, dim=0)
+        # Log-Gabor parameters
+        sigma_r = 0.4  # Radial bandwidth
+        sigma_phi = 0.3  # Angular bandwidth
         
-        alpha_diff = self._normalize01(alpha_diff)
+        # Radial component (log-Gabor)
+        radial = torch.exp(-(torch.log(R / scale + 1e-8))**2 / (2 * sigma_r**2))
         
-        return alpha_diff
+        # Angular component
+        angular = torch.exp(-((Phi - theta)**2) / (2 * sigma_phi**2))
+        
+        # Combine radial and angular components
+        filter_freq = radial * angular
+        
+        # Normalize
+        filter_freq = filter_freq / (torch.max(filter_freq) + 1e-8)
+        
+        # Add channel dimension
+        filter_freq = filter_freq.unsqueeze(0).unsqueeze(0)
+        
+        return filter_freq
 
     def _compute_gabor_responses(self, thermal_image, scales: Tuple[int, ...], orientations: int):
         responses = []
@@ -177,11 +241,30 @@ class ThermalPhysicsPrior(nn.Module):
         return (x - mn) / (mx - mn + eps)
 
     def forward(self, thermal_image):
+        # Thermal Edge Prior (P_e): Sobel gradient + multi-scale LoG
         temp_grad = self.compute_temperature_gradient(thermal_image)
+        multiscale_log = self.compute_multiscale_log_response(thermal_image)
+        
+        # Combine gradient and LoG responses as per Eq. (19-21)
+        # P_e = Norm(√((∂_x I_t)² + (∂_y I_t)²)) + ∑_σ w_σ · Norm(|∇² G_σ * I_t|)
+        temp_grad_norm = self._normalize01(temp_grad)
+        multiscale_log_norm = self._normalize01(multiscale_log)
+        thermal_edge_prior = temp_grad_norm + multiscale_log_norm
+        
+        # Thermal Diffusion Prior (P_d): Iterative Gaussian convolution
         temp_diffusion = self.compute_heat_diffusion(thermal_image)
+        
+        # Thermal Inertia Prior (P_i): Pseudo-temporal analysis
+        temp_inertia = self.compute_thermal_inertia_prior(thermal_image)
+        
+        # Emissivity Prior (P_a): Log-Gabor filter bank in frequency domain
+        temp_emissivity = self.compute_emissivity_prior(thermal_image)
 
-        prior_features = torch.cat([temp_grad, temp_diffusion], dim=1)
+        # Prior Fusion: Concat all 4 physical priors as per Eq. (43-45)
+        # P^l = φ(Concat[P_e, P_d, P_i, P_a])
+        prior_features = torch.cat([thermal_edge_prior, temp_diffusion, temp_inertia, temp_emissivity], dim=1)
 
+        # Channel alignment with 1x1 convolution
         prior_features = self.channel_alignment(prior_features) * self.scale
 
         return prior_features

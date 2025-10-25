@@ -218,14 +218,42 @@ class SwinTransformerBlock(nn.Module):
         x_windows = x_windows.view(-1, self.window_size1 * self.window_size1, C)
 
         if mean_sal is not None:
-            global_mean = mean_sal.mean().item()
+            num_windows = mean_sal.shape[0]
             base_size = self.window_size2
-            if global_mean > threshold_sal:
-                dyn_size = max(base_size - 2, 4)
-            else:
-                dyn_size = min(base_size + 2, 8)
-            y_windows = window_partition(shifted_y, dyn_size)
-            y_windows = y_windows.view(-1, dyn_size * dyn_size, C)
+            w_small = max(base_size - 2, 4)
+            w_large = min(base_size + 2, 8)
+            
+            window_sizes = torch.where(mean_sal >= threshold_sal, 
+                                     torch.tensor(w_small, device=mean_sal.device),
+                                     torch.tensor(w_large, device=mean_sal.device))
+            
+            y_windows_list = []
+            for i in range(num_windows):
+                window_size = window_sizes[i].item()
+                
+                windows_per_row = W // self.window_size1
+                row = i // windows_per_row
+                col = i % windows_per_row
+                
+                start_h = row * self.window_size1
+                end_h = start_h + self.window_size1
+                start_w = col * self.window_size1
+                end_w = start_w + self.window_size1
+                
+                window_feature = shifted_y[:, start_h:end_h, start_w:end_w, :]
+                
+                if window_size != self.window_size1:
+                    window_feature = F.interpolate(
+                        window_feature.permute(0, 3, 1, 2), 
+                        size=(window_size, window_size), 
+                        mode='bilinear', 
+                        align_corners=False
+                    ).permute(0, 2, 3, 1)
+                
+                window_flat = window_feature.view(-1, window_size * window_size, C)
+                y_windows_list.append(window_flat)
+            
+            y_windows = torch.cat(y_windows_list, dim=0)
         else:
             y_windows = window_partition(shifted_y, self.window_size2)
             y_windows = y_windows.view(-1, self.window_size2 * self.window_size2, C)
@@ -259,8 +287,33 @@ class SwinTransformerBlock(nn.Module):
             else:
                 shifted_sem = semantic
             if mean_sal is not None:
-                sem_windows = window_partition(shifted_sem, dyn_size)
-                sem_windows = sem_windows.view(-1, dyn_size * dyn_size, C)
+                sem_windows_list = []
+                for i in range(num_windows):
+                    window_size = window_sizes[i].item()
+                    
+                    windows_per_row = W // self.window_size1
+                    row = i // windows_per_row
+                    col = i % windows_per_row
+                    
+                    start_h = row * self.window_size1
+                    end_h = start_h + self.window_size1
+                    start_w = col * self.window_size1
+                    end_w = start_w + self.window_size1
+                    
+                    sem_window = shifted_sem[:, start_h:end_h, start_w:end_w, :]
+                    
+                    if window_size != self.window_size1:
+                        sem_window = F.interpolate(
+                            sem_window.permute(0, 3, 1, 2), 
+                            size=(window_size, window_size), 
+                            mode='bilinear', 
+                            align_corners=False
+                        ).permute(0, 2, 3, 1)
+                    
+                    sem_window_flat = sem_window.view(-1, window_size * window_size, C)
+                    sem_windows_list.append(sem_window_flat)
+                
+                sem_windows = torch.cat(sem_windows_list, dim=0)
             else:
                 sem_windows = window_partition(shifted_sem, self.window_size2)
                 sem_windows = sem_windows.view(-1, self.window_size2 * self.window_size2, C)
