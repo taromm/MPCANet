@@ -181,6 +181,8 @@ class TMSOD(nn.Module):
         fr = self.rgb_swin(rgb)
         ft = self.t_swin(t)
 
+        # ========== TPMA (Multi-Physical Prior Modulation) ==========
+        # Step 1: Extract four complementary physical priors from thermal image
         P_thermal = self.thermal_prior(t)
 
         self.debug_thermal = P_thermal
@@ -194,7 +196,9 @@ class TMSOD(nn.Module):
                                       align_corners=False)
         P_thermal_256 = F.interpolate(P_thermal_256, size=(fr[1].shape[2], fr[1].shape[3]), mode='bilinear',
                                       align_corners=False)
+        # ========== End of TPMA: Physical Prior Extraction ==========
 
+        # ========== Generate saliency map for TSM-CWI ==========
         semantic, p_saliency = self.MSA_sem(
             torch.cat((fr[3].flatten(2).transpose(1, 2),
                        ft[3].flatten(2).transpose(1, 2)), dim=1),
@@ -215,11 +219,20 @@ class TMSOD(nn.Module):
         P_sem = self.thermal_gate_proj(P_sem)
         semantic = semantic * P_sem
 
+        # ========== TSM-CWI (Thermo-Saliency Modulated Cross-Window Interaction) ==========
+        # This block performs THREE integrated functions:
+        # 1. TPMA: Physics-Guided Asymmetric Cross-Attention (lines 76-105 in adaWin.py)
+        #    - Q from RGB, K/V from Thermal (cross-attention)
+        #    - Inject P_thermal to suppress unreliable thermal regions
+        # 2. Dynamic Windowing: Adaptive window size selection based on saliency (adaWin.py:208-228)
+        # 3. Semantic Gating: Enhance salient regions using semantic features (adaWin.py:257)
+        
+        # Level 4 (12x12 resolution)
         att_4_r = self.MSA4_r(fr[3].flatten(2).transpose(1, 2),
                               ft[3].flatten(2).transpose(1, 2),
                               semantic=semantic,
-                              P_thermal=P_thermal_1024,
-                              p_saliency = p_saliency,
+                              P_thermal=P_thermal_1024,  # TPMA: Physical prior
+                              p_saliency = p_saliency,   # TSM-CWI: Dynamic windowing
                               alpha = 4,
                               threshold_sal = 0.3
                               )
@@ -229,6 +242,7 @@ class TMSOD(nn.Module):
                               semantic=semantic,
                               P_thermal=None, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
 
+        # Level 3 (24x24 resolution)
         att_3_r = self.MSA3_r(fr[2].flatten(2).transpose(1, 2),
                               ft[2].flatten(2).transpose(1, 2),
                               semantic=semantic,
@@ -239,6 +253,7 @@ class TMSOD(nn.Module):
                               semantic=semantic,
                               P_thermal=None, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
 
+        # Level 2 (48x48 resolution)
         att_2_r = self.MSA2_r(fr[1].flatten(2).transpose(1, 2),
                               ft[1].flatten(2).transpose(1, 2),
                               semantic=semantic,
@@ -248,6 +263,7 @@ class TMSOD(nn.Module):
                               fr[1].flatten(2).transpose(1, 2),
                               semantic=semantic,
                               P_thermal=None, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
+        # ========== End of TSM-CWI Part 1: Dynamic Windowing Attention ==========
 
         f1 = self.shallow_fusion(torch.cat([fr[0], ft[0]], dim=1))
 
@@ -259,9 +275,12 @@ class TMSOD(nn.Module):
             mode='bilinear', align_corners=False
         )
 
+        # ========== TSM-CWI Part 2: Deformable Alignment Module ==========
+        # Handles geometric misalignment between RGB-T modalities using deformable convolution
         F_final4, feat_r2t4, feat_t2r4 = self.align_att4(
             r4, t4, thermal_mask=p_saliency_4, value_gate=p_saliency_4
         )
+        # ========== End of TSM-CWI Part 2: Deformable Alignment ==========
 
         self.feat_r2t4 = feat_r2t4
         self.feat_t2r4 = feat_t2r4

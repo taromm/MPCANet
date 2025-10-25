@@ -1,0 +1,252 @@
+\section{Our Approach}
+In this section, we briefly elaborate on our proposed MPCANet architecture in Section~\ref{sec:arch}. The details of Multi-Physical Prior incorporating mechanism is illustrated in Section~\ref{sec:TPMA}. Second we describe the Thermo-RGB bi-attention block in Section~\ref{sec:tsm-cwi}. Then Section~\ref{sec:bsccd} introduce the Boundary-Semantic Synergistic Decoder. At last, we show the training loss in the Section~\ref{sec:MOCT}.
+
+\subsection{Network Architecture}
+Given RGB image $I_r$ and thermal image $I_t$, we employ dual-stream Swin Transformers~\cite{liu2021swin} as encoders to extract multi-scale features ${F_r^l}{l=1}^4$ and ${F_t^l}{l=1}^4$ independently. Unlike conventional architectures that directly fuse these features, we first apply physical prior modulation to mitigate thermal noise at the source (Section~\ref{sec:TPMA}). The modulated features then undergo bidirectional cross-modal alignment to handle spatial misalignment (Section~\ref{sec:tsm-cwi}). Finally, a cascaded decoder progressively refines the fused features while preserving boundary sharpness (Section~\ref{sec:bsccd}). The network is trained end-to-end with a multi-objective loss (Section~\ref{sec:MOCT}).
+
+\subsection{Multi-Physical Prior Modulation}
+\label{sec:TPMA}
+Standard attention mechanisms, being purely data-driven, inevitably inherit systematic biases when thermal images contain noise, sensor artifacts, or environmental interference. For instance, noisy thermal boundaries may receive high attention weights simply because the network has learned spurious correlations in the training data, while genuinely salient but low-contrast thermal regions may be overlooked. This creates an ``upstream pollution, downstream treatment'' dilemma where uncertainty and errors arise at the feature interaction stage and propagate throughout the entire network, corrupting subsequent fusion and prediction processes~\cite{cong2022does}.
+
+To address this fundamental issue, we propose to inject interpretable physical priors directly into attention weight generation. Rather than relying solely on learned patterns, we leverage established principles from thermodynamics and heat transfer to guide the network toward physically plausible cross-modal alignments. Our approach consists of two key steps: (1) extracting multiple complementary physical priors from thermal images that characterize reliability from different physical perspectives, and (2) incorporating these priors into an asymmetric attention mechanism that modulates cross-modal fusion based on both semantic relevance and physical reliability. This physics-guided design ensures that attention weights reflect not only learned visual patterns but also fundamental physical constraints, leading to more robust and interpretable cross-modal fusion.
+
+\subsubsection{Physical Prior Extraction}
+
+Thermal imaging follows fundamental physical laws that govern heat transfer and radiation. We leverage these principles to extract four complementary physical descriptors from the thermal image $I_t$, each targeting a specific aspect of thermal signal reliability.
+
+Thermal Edge Prior ($P_e$): In thermal physics, genuine object boundaries manifest as sharp, spatially coherent temperature gradients due to material discontinuities, whereas sensor noise produces spatially random high-frequency fluctuations without structural consistency. Exploiting this fundamental difference, we combine Sobel gradient operators with multi-scale Laplacian-of-Gaussian (LoG) filters to capture robust boundary information:
+\begin{equation}
+P_e = \text{Norm}\left(\sqrt{(\partial_x I_t)^2 + (\partial_y I_t)^2}\right) + \sum_{\sigma} w_\sigma \cdot \text{Norm}(|\nabla^2 G_\sigma * I_t|),
+\end{equation}
+where $G_\sigma$ denotes Gaussian kernels at different scales and $w_\sigma$ are learnable weights. The gradient term captures first-order discontinuities, while the LoG responses detect second-order zero-crossings characteristic of true edges~\cite{canny2009computational}.
+
+Thermal Diffusion Prior ($P_d$): Beyond boundaries, the spatial distribution of thermal energy also carries physical meaning. According to Fourier's law of heat conduction, thermal energy diffuses from high-temperature regions to low-temperature surroundings, creating smooth and continuous temperature fields while preserving genuine heat sources due to energy conservation. To exploit this natural smoothing property for noise suppression, we simulate the diffusion process through iterative Gaussian convolution:
+\begin{equation}
+P_d = G_\sigma^{(\tau)} * I_t,
+\end{equation}
+where $\tau$ controls the number of diffusion iterations. This prior helps distinguish coherent thermal structures from isolated noise spikes that lack physical support~\cite{perona2002scale}.
+
+Thermal Inertia Prior ($P_i$): While diffusion captures spatial consistency, temporal stability provides another dimension of reliability. Real-world salient objects typically possess high thermal mass, causing their temperature profiles to resist rapid changes and remain stable over time. Although we operate on single-frame images, this temporal characteristic can be approximated through pseudo-temporal analysis. Specifically, we construct a diffusion sequence that simulates temporal evolution and measure the cumulative temperature variations:
+\begin{equation}
+P_i = \sum_{s=0}^{S-1} |I_t^{(s+1)} - I_t^{(s)}|, \quad \text{where } I_t^{(s+1)} = G_\sigma * I_t^{(s)},
+\end{equation}
+with $I_t^{(0)} = I_t$ as initialization. Regions exhibiting small cumulative changes indicate thermally inert objects, whereas large variations suggest noise or thermal transients.
+
+Emissivity Prior ($P_a$): The three spatial priors above operate in the image domain, but thermal signatures also contain rich information in the frequency domain. Different materials possess distinct thermal emissivity profiles—the efficiency with which they emit infrared radiation—which manifest as characteristic spectral patterns. These material-dependent signatures are often invisible to purely spatial operators but can be revealed through frequency analysis. To capture such discriminative spectral features, we apply a bank of log-Gabor filters:
+\begin{equation}
+P_a = \text{Concat}[\mathcal{F}^{-1}(H_b \cdot \mathcal{F}(I_t))]{b=1}^B,
+\end{equation}
+where $\mathcal{F}$ and $\mathcal{F}^{-1}$ denote Fourier transform and its inverse, and ${H_b}{b=1}^B$ is the filter bank covering complementary frequency ranges. This prior provides material-level discrimination complementary to the spatial priors~\cite{fischer2007self}.
+
+Prior Fusion: Having obtained four physically grounded descriptors—boundary structure ($P_e$), spatial coherence ($P_d$), temporal stability ($P_i$), and spectral signature ($P_a$)—we fuse them into a unified representation through adaptive channel-wise weighting:
+\begin{equation}
+P^l = \phi(\text{Concat}[P_e, P_d, P_i, P_a]) \in \mathbb{R}^{H_l \times W_l \times C_p},
+\end{equation}
+where $\phi$ is a $1\times1$ convolution that learns to balance their contributions. The fused prior $P^l$ is then downsampled via average pooling to match each encoder level $l$, providing multi-scale physical guidance for subsequent feature modulation.
+
+\subsubsection{Physics-Guided Asymmetric Attention}
+Having extracted multi-physical priors that encode thermal reliability, we now incorporate them into the cross-modal fusion process. Standard cross-modal fusion treats RGB and thermal features symmetrically, applying identical attention mechanisms to both modalities. However, this ignores the inherent asymmetry in their information content—RGB images typically contain richer semantic details and spatial structures, while thermal images excel at highlighting salient objects through temperature contrast. To leverage this complementary nature, we propose an asymmetric attention mechanism where thermal features actively query and retrieve semantic information from RGB features, modulated by the physical reliability priors.
+
+Specifically, at each encoder level $l$, we perform bidirectional cross-attention between RGB features $F_r^l$ and thermal features $F_t^l$.
+
+\textbf{Thermal-to-RGB attention (physics-guided).} For thermal features querying RGB information, we extract query features from the thermal stream and key-value features from the RGB stream. The attention weights are computed as:
+\begin{equation}
+A_t^l = \text{Softmax}\left(\frac{Q(F_t^l) \cdot K(F_r^l)^T}{\sqrt{d_k}}\right),
+\end{equation}
+where $Q(\cdot)$ and $K(\cdot)$ are linear projections, and $d_k$ is the key dimension. This cross-attention allows thermal features to selectively retrieve complementary semantic information from RGB features based on content relevance.
+
+However, thermal images often suffer from low spatial resolution and sensor noise, making purely learned attention vulnerable to unreliable thermal regions. To enhance robustness, we incorporate physical reliability priors to modulate the fused features:
+\begin{equation}
+\hat{F}_t^l = A_t^l \cdot V(F_r^l) \odot \sigma(P^l) + F_t^l,
+\end{equation}
+where $V(\cdot)$ is a value projection, $\sigma(\cdot)$ is the sigmoid function, and $\odot$ denotes element-wise multiplication. The physical prior $P^l$ acts as a reliability mask, suppressing attention responses in physically unreliable regions (e.g., noisy boundaries, thermal artifacts) while enhancing genuine salient areas.
+
+\textbf{RGB-to-Thermal attention (standard).} For RGB features querying thermal information, we compute standard cross-attention without physics prior modulation to preserve high-quality RGB semantics:
+\begin{equation}
+A_r^l = \text{Softmax}\left(\frac{Q(F_r^l) \cdot K(F_t^l)^T}{\sqrt{d_k}}\right),
+\end{equation}
+\begin{equation}
+\hat{F}_r^l = A_r^l \cdot V(F_t^l) + F_r^l,
+\end{equation}
+where the RGB features retrieve saliency-relevant thermal information without additional modulation. This asymmetric design ensures that physical priors guide the thermal branch (which needs reliability enhancement) while preserving the integrity of the RGB branch (which already provides reliable semantics).
+
+This physics-guided asymmetric attention provides several benefits: (1) physical priors suppress unreliable thermal signals, preventing noise propagation; (2) bidirectional fusion allows both modalities to retrieve complementary information; and (3) asymmetric modulation preserves high-quality RGB information while enhancing thermal features with physically plausible guidance, achieving robust cross-modal fusion without degrading either modality.
+
+\subsection{Thermo-Saliency Modulated Cross-Window Interaction}
+\label{sec:tsm-cwi}
+
+Although the TPMA module provides physically-purified and semantically-enhanced features, it does not address the inherent spatial misalignment in RGB-T data caused by viewpoint differences, sensor displacement, or scene depth variations. Existing windowed attention methods, such as Swin Transformer \cite{liu2021swin}, typically employ static window sizes that struggle to adapt to varying object scales—small windows may fragment large objects, while large windows may blur small details. Furthermore, their rigid rectangular windows cannot handle non-rigid deformations or local geometric distortions common in RGB-T pairs.
+
+To overcome these limitations, we propose the \textbf{Thermo-Saliency Modulated Cross-Window Interaction (TSM-CWI)} mechanism. The core idea is to leverage high-level saliency information as a dual guide to simultaneously control (1) the attention's perceptual scope (window size) and (2) its alignment precision (sampling locations).
+
+\subsubsection{Saliency Map Generation}
+
+To guide both window size selection and deformable alignment, we first generate a saliency prior map at each encoder level $l$. Specifically, we use a lightweight convolutional head $\mathcal{H}(\cdot)$ to predict the saliency map from the fused features:
+\begin{equation}
+S^l = \mathcal{H}([\hat{F}_r^l, \hat{F}_t^l]) \in \mathbb{R}^{H_l \times W_l},
+\end{equation}
+where $[\cdot, \cdot]$ denotes channel-wise concatenation, and $\mathcal{H}(\cdot)$ consists of a few convolutional layers followed by a sigmoid activation to produce values in $[0, 1]$. This saliency map $S^l$ indicates the probability that each spatial location belongs to a salient object, serving as semantic guidance for subsequent operations.
+
+\subsubsection{Saliency-Aware Dynamic Windowing}
+
+Using the saliency map $S^l$, we adaptively determine the window size for each spatial region. The feature map is partitioned into non-overlapping windows ${\omega_1, \omega_2, \ldots, \omega_N}$. For each window $\omega_i$, we compute its average saliency:
+\begin{equation}
+\bar{s}i = \frac{1}{|\omega_i|} \sum{(x,y) \in \omega_i} S^l(x,y),
+\end{equation}
+where $|\omega_i|$ is the number of pixels in window $\omega_i$. We also compute the global average saliency across all windows:
+\begin{equation}
+\bar{s} = \frac{1}{N} \sum_{i=1}^{N} \bar{s}_i,
+\end{equation}
+where $N$ is the total number of windows, and $\bar{s}$ represents the average saliency across the entire feature map.
+
+Based on this metric, we can dynamically select the window size. A straightforward approach is to use a global selection strategy:
+\begin{equation}
+w^\star =
+\begin{cases}
+w_{\text{small}}, & \text{if } \bar{s} \ge \tau, \\
+w_{\text{large}}, & \text{otherwise},
+\end{cases}
+\end{equation}
+where $w^\star$ is the globally selected window size. When salient objects in the scene are concentrated (higher $\bar{s}$), we use small windows to focus on details; otherwise, we use large windows to capture broader context.
+
+\subsubsection{Semantics-Guided Deformable Alignment}
+
+After determining adaptive window sizes ${w_1, w_2, \ldots, w_N}$ for each spatial region, we perform cross-window interaction (CWI) with deformable alignment to handle geometric misalignment between RGB and thermal modalities. The key insight is to use the saliency map $S^l$ (from Section 3.3.1) to guide both the attention computation and the deformable sampling process.
+
+\textbf{Offset prediction.} We first predict spatial offsets for deformable sampling using an offset network $\Phi(\cdot)$ that takes the cross-modal features and saliency guidance as input:
+\begin{equation}
+\Delta^{l} = \Phi([\hat{F}_r^l, \hat{F}_t^l, S^l]) \in \mathbb{R}^{H_l \times W_l \times 2K},
+\end{equation}
+where $K$ is the number of sampling points per spatial location, and each offset has 2 dimensions $(dx, dy)$ representing horizontal and vertical displacement.
+
+\textbf{Thermal-to-RGB attention with deformable alignment.} For thermal features querying complementary information from RGB features, we perform the following steps:
+
+First, we compute the query and key projections:
+\begin{equation}
+Q_t^l = Q(\hat{F}_t^l), \quad K_r^l = K(\hat{F}_r^l),
+\end{equation}
+where $Q(\cdot)$ and $K(\cdot)$ are linear projection layers.
+
+Then, we compute attention weights within each dynamically-sized window $w_i$ (determined in Section 3.3.2):
+\begin{equation}
+A_{t \rightarrow r}^l = \text{Softmax}\left(\frac{Q_t^l \cdot (K_r^l)^T}{\sqrt{d_k}} + \lambda P^l\right),
+\end{equation}
+where $\lambda P^l$ is the physics prior bias inherited from TPMA to suppress unreliable thermal regions, and attention is computed independently within each window of size $w_i$.
+
+To handle geometric misalignment, we apply saliency-modulated deformable sampling to the RGB value features:
+\begin{equation}
+V_r^l = V(\hat{F}_r^l) \odot (1 + \gamma \cdot S^l),
+\end{equation}
+\begin{equation}
+\tilde{V}_r^l = \mathcal{D}(V_r^l, \Delta^{l}),
+\end{equation}
+where $V(\cdot)$ is the value projection, $\gamma$ is a learnable scaling parameter, $\odot$ denotes element-wise multiplication, and $\mathcal{D}(\cdot, \Delta)$ performs deformable sampling (bilinear interpolation) at the predicted offset locations $\Delta^l$. The saliency modulation $(1 + \gamma \cdot S^l)$ amplifies value features at salient locations before sampling, ensuring that important semantic information is preserved during alignment.
+
+Finally, we aggregate the deformably-sampled values using the attention weights:
+\begin{equation}
+Z_t^l = A_{t \rightarrow r}^l \cdot \tilde{V}_r^l,
+\end{equation}
+where $Z_t^l$ represents thermal features enhanced by geometrically-aligned RGB information.
+
+\textbf{RGB-to-Thermal attention.} For RGB features querying thermal information, we use standard windowed attention without deformable alignment to preserve high-quality RGB semantics:
+\begin{equation}
+Q_r^l = Q(\hat{F}r^l), \quad K_t^l = K(\hat{F}t^l),
+\end{equation}
+\begin{equation}
+A{r \rightarrow t}^l = \text{Softmax}\left(\frac{Q_r^l \cdot (K_t^l)^T}{\sqrt{d_k}}\right),
+\end{equation}
+\begin{equation}
+Z_r^l = A{r \rightarrow t}^l \cdot V(\hat{F}_t^l),
+\end{equation}
+where attention is computed within the same dynamic windows as the thermal-to-RGB branch, ensuring spatial consistency.
+
+\textbf{Feature fusion.} The bidirectional aligned features are concatenated and fused through a convolutional layer:
+\begin{equation}
+F^l = \text{Conv}([Z_r^l, Z_t^l]),
+\end{equation}
+where $F^l \in \mathbb{R}^{H_l \times W_l \times C}$ represents the final fused features at level $l$ that are spatially aligned (via deformable sampling), semantically coherent (via saliency guidance), and physically reliable (via physics priors).
+
+The benefit of this semantics-guided deformable alignment is multi-fold: (1) adaptive window sizes ensure optimal receptive fields for different object scales; (2) physics-biased attention maintains robustness against thermal noise; (3) deformable sampling handles local geometric distortions and non-rigid misalignments; and (4) bidirectional interaction preserves complementary information from both modalities. Together, these components provide spatially aligned, semantically coherent, and physically reliable fused features $F^l$ for subsequent decoding \cite{tu2022weakly}.
+
+\subsection{Boundary-Semantic Coupled Cascaded Decoder}
+\label{sec:bsccd}
+
+In RGB-T decoding, directly using skip-connections often causes "modal conflict," since RGB texture boundaries and thermal temperature boundaries are naturally inconsistent. To address this, we propose the \textbf{Boundary-Semantic Coupled Cascaded Decoder (BS-CCD)}, which uses edge-aware skip fusion and semantic gating to eliminate boundary conflicts.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=1\linewidth]{pipeline_2.pdf}
+\vspace{-1.2em}
+\caption{Architecture of the Boundary-Semantic Coupled Cascaded Decoder (BS-CCD).}
+\label{fig:pipeline2}
+\vspace{-1em}
+\end{figure}
+
+\subsubsection{Edge-Aware Skip Fusion}
+
+At each decoding stage $l$, we concatenate the upsampled fused features with RGB skip connections and predict boundary attention to suppress modal conflicts:
+\begin{equation}
+U^l = [\text{Up}(F^{l-1}), F_r^l], \quad E^l = \sigma(\text{EdgeHead}(U^l)),
+\end{equation}
+\begin{equation}
+\tilde{F}^l = \text{Conv}{3\times3}(U^l) \odot E^l,
+\end{equation}
+where EdgeHead is a lightweight network shared across all stages, and $E^l$ is the predicted edge attention mask. A boundary loss $\mathcal{L}{\text{edge}} = \text{BCE}(E^l, B^*)$ is applied for supervision.
+
+\subsubsection{Semantic Gating}
+
+The boundary-purified features are further modulated by semantic guidance from the previous decoder stage (or encoder saliency $S^L$ for the deepest stage):
+\begin{equation}
+S^l = \sigma(\text{Conv}_{1\times1}(\tilde{F}^l \odot (1 + \gamma \cdot S^{l-1}))),
+\end{equation}
+where $\gamma$ is learnable and $S^l$ is the saliency prediction at stage $l$.
+
+In summary, BS-CCD purifies skip-connections through edge attention and enhances salient regions through semantic gating, alleviating cross-modal boundary conflicts.
+
+\subsection{Multi-Objective Consistent Training}
+\label{sec:training}
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=1\linewidth]{pipeline_3.pdf}
+\vspace{-1.2em}
+\caption{Illustration of our Multi-Objective Consistent Training (MOCT) strategy, designed to resolve "internal discoordination" by enforcing consistency across multiple objectives: pixel/region saliency, structure smoothness, boundary alignment, and cross-modal feature consistency.}
+\label{fig:moct}
+\vspace{-1em}
+\end{figure}
+
+Training a complex multi-module network with only a simple loss function (e.g., BCE + Dice) often leads to "internal discoordination." For instance, the edge prediction from the decoder may become inconsistent with the boundaries of the final saliency map, or the feature alignment module might excessively distort features to optimize the final metric. This "black-box" training approach ignores critical intermediate processes, leading to unstable training and limited generalization.
+
+To address this, we propose the \textbf{Multi-Objective Consistent Training (MOCT)} strategy. Its core idea is to apply end-to-end constraints from multiple dimensions—pixel, region, structure, boundary, and feature—through a composite loss function. This strategy not only supervises the final output but also enforces consistency across key intermediate representations (like edge predictions) and inter-module relationships (like feature alignment quality), ensuring the entire framework learns as a cohesive whole.
+
+Our overall loss is:
+\begin{equation}
+\mathcal{L} = \mathcal{L}{\text{sal}} + \lambda{\text{sm}}\mathcal{L}{\text{sm}} + \lambda{\text{edge}}\mathcal{L}{\text{edge}} + \lambda{\text{cons}}\mathcal{L}{\text{cons}},
+\end{equation}
+where $\lambda{\text{sm}}=0.8$, $\lambda_{\text{edge}}=0.5$, and $\lambda_{\text{cons}}=0.1$.
+
+\textbf{Primary saliency supervision} ($\mathcal{L}{\text{sal}}$) combines BCE and Dice losses to supervise pixel-level accuracy and region-level integrity across all decoder stages:
+\begin{equation}
+\mathcal{L}{\text{sal}} = \sum_l [\text{BCE}(S^l, S^) + \text{Dice}(S^l, S^)],
+\end{equation}
+where $S^l$ are predictions from decoder stages and $S^*$ is the ground truth.
+
+\textbf{Structure-preserving smoothness} ($\mathcal{L}{\text{sm}}$) encourages spatial coherence while preserving boundaries, using a gradient-guided Charbonnier penalty:
+\begin{equation}
+\mathcal{L}{\text{sm}} = \mathbb{E}[\rho(e^{-\alpha|\nabla_x S^|}|\nabla_x S^1|) + \rho(e^{-\alpha|\nabla_y S^|}|\nabla_y S^1|)],
+\end{equation}
+where $\rho(z)=\sqrt{z^2+\epsilon^2}$ applies strong smoothing in flat regions and weak smoothing near edges.
+
+\textbf{Explicit edge alignment} ($\mathcal{L}{\text{edge}}$) enforces consistency between the decoder's edge predictions $E^l$ and the boundaries extracted from the final saliency map $\mathcal{E}(S^1)$, both constrained toward the ground-truth boundary $B^*$:
+\begin{equation}
+\mathcal{L}{\text{edge}} = \sum_l |E^l - B^|_1 + \beta |\mathcal{E}(S^1) - B^|_1,
+\end{equation}
+where $\mathcal{E}(\cdot)$ is an edge extraction operator. This ensures internal boundary representations remain mutually consistent, preventing the edge branch from diverging from the final output.
+
+\textbf{Cross-modal alignment consistency} ($\mathcal{L}{\text{cons}}$) supervises the TSM-CWI alignment quality by enforcing that aligned features remain consistent with the original features of the target modality:
+\begin{equation}
+\mathcal{L}{\text{cons}} = \sum_l [|\text{Norm}(Z_r^l) - \text{Norm}(F_r^l)|_1 + |\text{Norm}(Z_t^l) - \text{Norm}(\hat{F}_t^l)|_1],
+\end{equation}
+where $Z_r^l, Z_t^l$ are aligned features from TSM-CWI, $F_r^l, \hat{F}_t^l$ are original features from TPMA. This feature-level consistency constraint prevents excessive distortion during alignment, ensuring stable cross-modal fusion.
+
+By enforcing consistency across these multiple objectives, MOCT ensures that all network modules work in harmony—edge predictions align with final boundaries, feature alignment preserves modality characteristics, and the final output maintains both structural coherence and pixel accuracy.
