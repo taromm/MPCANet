@@ -36,6 +36,27 @@ class BasicConv2d(nn.Module):
         x = self.bn(x)
         return x
 
+class SaliencyHead(nn.Module):
+    def __init__(self, in_channels, resolution):
+        super().__init__()
+        self.resolution = resolution
+        self.conv_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 2, in_channels // 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(in_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 4, 1, kernel_size=1)
+        )
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, fr, ft):
+        fused_feat = torch.cat([fr, ft], dim=1)
+        saliency_logits = self.conv_head(fused_feat)
+        saliency_map = self.sigmoid(saliency_logits)
+        return saliency_map
+
 class EdgeHead(nn.Module):
     def __init__(self, in_dim, dilation=1):
         super().__init__()
@@ -54,7 +75,7 @@ class EdgeHead(nn.Module):
         edge_feat = self.relu1(self.bn1(self.conv1(x)))
         edge_feat = self.relu2(self.bn2(self.conv2(edge_feat)))
         
-        edge_map = self.sigmoid(self.edge_pred(edge_feat))
+        edge_map = self.edge_pred(edge_feat)
         
         return edge_map
 
@@ -82,6 +103,10 @@ class TMSOD(nn.Module):
         
         self.MSA_sem = GMSA_ini(d_model=1024, num_layers=3, resolution=(16, 18))
         self.conv_sem = conv3x3_bn_relu(1024*2, 1024)
+        
+        self.saliency_head_4 = SaliencyHead(in_channels=1024*2, resolution=(12, 12))
+        self.saliency_head_3 = SaliencyHead(in_channels=512*2, resolution=(24, 24))
+        self.saliency_head_2 = SaliencyHead(in_channels=256*2, resolution=(48, 48))
         
         self.MSA4_r = SwinTransformerBlock(dim=1024, input_resolution=(12,12), num_heads=2, up_ratio=1, out_channels=1024)
         self.MSA4_t = SwinTransformerBlock(dim=1024, input_resolution=(12, 12), num_heads=2, up_ratio=1,out_channels=1024)
@@ -181,8 +206,6 @@ class TMSOD(nn.Module):
         fr = self.rgb_swin(rgb)
         ft = self.t_swin(t)
 
-        # ========== TPMA (Multi-Physical Prior Modulation) ==========
-        # Step 1: Extract four complementary physical priors from thermal image
         P_thermal = self.thermal_prior(t)
 
         self.debug_thermal = P_thermal
@@ -190,22 +213,24 @@ class TMSOD(nn.Module):
         P_thermal_1024 = self.thermal_proj_1024(P_thermal)
         P_thermal_512 = self.thermal_proj_512(P_thermal)
         P_thermal_256 = self.thermal_proj_256(P_thermal)
-        P_thermal_1024 = F.interpolate(P_thermal_1024, size=(fr[3].shape[2], fr[3].shape[3]), mode='bilinear',
-                                       align_corners=False)
-        P_thermal_512 = F.interpolate(P_thermal_512, size=(fr[2].shape[2], fr[2].shape[3]), mode='bilinear',
-                                      align_corners=False)
-        P_thermal_256 = F.interpolate(P_thermal_256, size=(fr[1].shape[2], fr[1].shape[3]), mode='bilinear',
-                                      align_corners=False)
-        # ========== End of TPMA: Physical Prior Extraction ==========
+        P_thermal_1024 = F.adaptive_avg_pool2d(P_thermal_1024, output_size=(fr[3].shape[2], fr[3].shape[3]))
+        P_thermal_512 = F.adaptive_avg_pool2d(P_thermal_512, output_size=(fr[2].shape[2], fr[2].shape[3]))
+        P_thermal_256 = F.adaptive_avg_pool2d(P_thermal_256, output_size=(fr[1].shape[2], fr[1].shape[3]))
 
-        # ========== Generate saliency map for TSM-CWI ==========
-        semantic, p_saliency = self.MSA_sem(
+        p_saliency_4 = self.saliency_head_4(fr[3], ft[3])
+        
+        p_saliency_3 = self.saliency_head_3(fr[2], ft[2])
+        
+        p_saliency_2 = self.saliency_head_2(fr[1], ft[1])
+        
+        self.pred_saliency = p_saliency_4
+        
+        semantic, p_saliency_init = self.MSA_sem(
             torch.cat((fr[3].flatten(2).transpose(1, 2),
                        ft[3].flatten(2).transpose(1, 2)), dim=1),
             torch.cat((fr[3].flatten(2).transpose(1, 2),
                        ft[3].flatten(2).transpose(1, 2)), dim=1)
         )
-        self.pred_saliency = p_saliency
 
         semantic1, semantic2 = torch.split(semantic, fr[3].shape[2] * fr[3].shape[3], dim=1)
         semantic = self.conv_sem(torch.cat((
@@ -219,68 +244,65 @@ class TMSOD(nn.Module):
         P_sem = self.thermal_gate_proj(P_sem)
         semantic = semantic * P_sem
 
-        # ========== TSM-CWI (Thermo-Saliency Modulated Cross-Window Interaction) ==========
-        # This block performs THREE integrated functions:
-        # 1. TPMA: Physics-Guided Asymmetric Cross-Attention (lines 76-105 in adaWin.py)
-        #    - Q from RGB, K/V from Thermal (cross-attention)
-        #    - Inject P_thermal to suppress unreliable thermal regions
-        # 2. Dynamic Windowing: Adaptive window size selection based on saliency (adaWin.py:208-228)
-        # 3. Semantic Gating: Enhance salient regions using semantic features (adaWin.py:257)
-        
-        # Level 4 (12x12 resolution)
         att_4_r = self.MSA4_r(fr[3].flatten(2).transpose(1, 2),
                               ft[3].flatten(2).transpose(1, 2),
                               semantic=semantic,
-                              P_thermal=P_thermal_1024,  # TPMA: Physical prior
-                              p_saliency = p_saliency,   # TSM-CWI: Dynamic windowing
-                              alpha = 4,
-                              threshold_sal = 0.3
-                              )
-
+                              P_thermal=None,
+                              p_saliency=p_saliency_4,
+                              alpha=4,
+                              threshold_sal=0.3)
+        
         att_4_t = self.MSA4_t(ft[3].flatten(2).transpose(1, 2),
                               fr[3].flatten(2).transpose(1, 2),
                               semantic=semantic,
-                              P_thermal=None, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
-
-        # Level 3 (24x24 resolution)
+                              P_thermal=P_thermal_1024,
+                              p_saliency=p_saliency_4,
+                              alpha=4,
+                              threshold_sal=0.3)
+        
         att_3_r = self.MSA3_r(fr[2].flatten(2).transpose(1, 2),
                               ft[2].flatten(2).transpose(1, 2),
                               semantic=semantic,
-                              P_thermal=P_thermal_512, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
-
+                              P_thermal=None,
+                              p_saliency=p_saliency_3,
+                              alpha=4,
+                              threshold_sal=0.3)
+        
         att_3_t = self.MSA3_t(ft[2].flatten(2).transpose(1, 2),
                               fr[2].flatten(2).transpose(1, 2),
                               semantic=semantic,
-                              P_thermal=None, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
-
-        # Level 2 (48x48 resolution)
+                              P_thermal=P_thermal_512,
+                              p_saliency=p_saliency_3,
+                              alpha=4,
+                              threshold_sal=0.3)
+        
         att_2_r = self.MSA2_r(fr[1].flatten(2).transpose(1, 2),
                               ft[1].flatten(2).transpose(1, 2),
                               semantic=semantic,
-                              P_thermal=P_thermal_256, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
-
+                              P_thermal=None,
+                              p_saliency=p_saliency_2,
+                              alpha=4,
+                              threshold_sal=0.3)
+        
         att_2_t = self.MSA2_t(ft[1].flatten(2).transpose(1, 2),
                               fr[1].flatten(2).transpose(1, 2),
                               semantic=semantic,
-                              P_thermal=None, p_saliency=p_saliency, alpha=4, threshold_sal=0.3)
-        # ========== End of TSM-CWI Part 1: Dynamic Windowing Attention ==========
+                              P_thermal=P_thermal_256,
+                              p_saliency=p_saliency_2,
+                              alpha=4,
+                              threshold_sal=0.3)
 
         f1 = self.shallow_fusion(torch.cat([fr[0], ft[0]], dim=1))
 
         r4 = att_4_r.view(att_4_r.shape[0], fr[3].shape[2], fr[3].shape[3], -1).permute(0, 3, 1, 2).contiguous()
         t4 = att_4_t.view(att_4_t.shape[0], fr[3].shape[2], fr[3].shape[3], -1).permute(0, 3, 1, 2).contiguous()
 
-        p_saliency_4 = F.interpolate(
-            p_saliency, size=(r4.shape[2], r4.shape[3]),
-            mode='bilinear', align_corners=False
-        )
-
-        # ========== TSM-CWI Part 2: Deformable Alignment Module ==========
-        # Handles geometric misalignment between RGB-T modalities using deformable convolution
         F_final4, feat_r2t4, feat_t2r4 = self.align_att4(
-            r4, t4, thermal_mask=p_saliency_4, value_gate=p_saliency_4
+            fr=r4,
+            ft=t4,
+            P_thermal=P_thermal_1024,
+            saliency_map=p_saliency_4
         )
-        # ========== End of TSM-CWI Part 2: Deformable Alignment ==========
 
         self.feat_r2t4 = feat_r2t4
         self.feat_t2r4 = feat_t2r4
@@ -292,13 +314,11 @@ class TMSOD(nn.Module):
         r3 = att_3_r.view(att_3_r.shape[0], fr[2].shape[2], fr[2].shape[3], -1).permute(0, 3, 1, 2).contiguous()
         t3 = att_3_t.view(att_3_t.shape[0], fr[2].shape[2], fr[2].shape[3], -1).permute(0, 3, 1, 2).contiguous()
 
-        p_saliency_3 = F.interpolate(
-            p_saliency, size=(r3.shape[2], r3.shape[3]),
-            mode='bilinear', align_corners=False
-        )
-
         F_final3, feat_r2t3, feat_t2r3 = self.align_att3(
-            r3, t3, thermal_mask=p_saliency_3, value_gate=p_saliency_3
+            fr=r3,
+            ft=t3,
+            P_thermal=P_thermal_512,
+            saliency_map=p_saliency_3
         )
 
         self.feat_r2t3 = feat_r2t3
@@ -311,13 +331,11 @@ class TMSOD(nn.Module):
         r2 = att_2_r.view(att_2_r.shape[0], fr[1].shape[2], fr[1].shape[3], -1).permute(0, 3, 1, 2).contiguous()
         t2 = att_2_t.view(att_2_t.shape[0], fr[1].shape[2], fr[1].shape[3], -1).permute(0, 3, 1, 2).contiguous()
 
-        p_saliency_2 = F.interpolate(
-            p_saliency, size=(r2.shape[2], r2.shape[3]),
-            mode='bilinear', align_corners=False
-        )
-
         F_final2, feat_r2t2, feat_t2r2 = self.align_att2(
-            r2, t2, thermal_mask=p_saliency_2, value_gate=p_saliency_2
+            fr=r2,
+            ft=t2,
+            P_thermal=P_thermal_256,
+            saliency_map=p_saliency_2
         )
 
         self.feat_r2t2 = feat_r2t2
@@ -327,30 +345,34 @@ class TMSOD(nn.Module):
 
         r2 = self.convAtt2(torch.cat((r2, F_final2), dim=1))
 
-        U4 = torch.cat([F.interpolate(r3, size=(fr[3].shape[2], fr[3].shape[3]), mode='bilinear', align_corners=False), fr[3]], dim=1)
-        E4 = torch.sigmoid(self.edge_head(U4))
-        F_tilde_4 = self.decode4(U4) * E4
+        U4 = torch.cat([r4, fr[3]], dim=1)
+        U4_proj = self.edge_preproj_4(U4)
+        E4 = torch.sigmoid(self.edge_head(U4_proj))
+        F_tilde_4 = self.decode4(U4_proj) * E4
         p_saliency_norm_4 = self._norm_minmax(p_saliency_4)
         A_sem_4 = 1 + self.gamma_dec * p_saliency_norm_4
         S4 = torch.sigmoid(self.sal_head4(F_tilde_4 * A_sem_4))
 
-        U3 = torch.cat([F.interpolate(r2, size=(fr[2].shape[2], fr[2].shape[3]), mode='bilinear', align_corners=False), fr[2]], dim=1)
-        E3 = torch.sigmoid(self.edge_head(U3))
-        F_tilde_3 = self.decode3(U3) * E3
+        U3 = torch.cat([F.interpolate(F_tilde_4, size=(fr[2].shape[2], fr[2].shape[3]), mode='bilinear', align_corners=False), fr[2]], dim=1)
+        U3_proj = self.edge_preproj_3(U3)
+        E3 = torch.sigmoid(self.edge_head(U3_proj))
+        F_tilde_3 = self.decode3(U3_proj) * E3
         S4_upsampled = F.interpolate(S4, size=(F_tilde_3.shape[2], F_tilde_3.shape[3]), mode='bilinear', align_corners=False)
         A_sem_3 = 1 + self.gamma_dec * self._norm_minmax(S4_upsampled)
         S3 = torch.sigmoid(self.sal_head3(F_tilde_3 * A_sem_3))
 
-        U2 = torch.cat([F.interpolate(f1, size=(fr[1].shape[2], fr[1].shape[3]), mode='bilinear', align_corners=False), fr[1]], dim=1)
-        E2 = torch.sigmoid(self.edge_head(U2))
-        F_tilde_2 = self.decode2(U2) * E2
+        U2 = torch.cat([F.interpolate(F_tilde_3, size=(fr[1].shape[2], fr[1].shape[3]), mode='bilinear', align_corners=False), fr[1]], dim=1)
+        U2_proj = self.edge_preproj_2(U2)
+        E2 = torch.sigmoid(self.edge_head(U2_proj))
+        F_tilde_2 = self.decode2(U2_proj) * E2
         S3_upsampled = F.interpolate(S3, size=(F_tilde_2.shape[2], F_tilde_2.shape[3]), mode='bilinear', align_corners=False)
         A_sem_2 = 1 + self.gamma_dec * self._norm_minmax(S3_upsampled)
         S2 = torch.sigmoid(self.sal_head2(F_tilde_2 * A_sem_2))
 
-        U1 = torch.cat([F.interpolate(f1, size=(fr[0].shape[2], fr[0].shape[3]), mode='bilinear', align_corners=False), fr[0]], dim=1)
-        E1 = torch.sigmoid(self.edge_head(U1))
-        F_tilde_1 = self.decode1(U1) * E1
+        U1 = torch.cat([F.interpolate(F_tilde_2, size=(fr[0].shape[2], fr[0].shape[3]), mode='bilinear', align_corners=False), fr[0]], dim=1)
+        U1_proj = self.edge_preproj_1(U1)
+        E1 = torch.sigmoid(self.edge_head(U1_proj))
+        F_tilde_1 = self.decode1(U1_proj) * E1
         S2_upsampled = F.interpolate(S2, size=(F_tilde_1.shape[2], F_tilde_1.shape[3]), mode='bilinear', align_corners=False)
         A_sem_1 = 1 + self.gamma_dec * self._norm_minmax(S2_upsampled)
         S1 = torch.sigmoid(self.sal_head1(F_tilde_1 * A_sem_1))
@@ -359,8 +381,9 @@ class TMSOD(nn.Module):
         out = self.conv64(out)
         
         self.edge_maps = [E1, E2, E3, E4]
+        self.saliency_maps = [S1, S2, S3, S4]
         
-        return out, p_saliency, P_thermal
+        return out, p_saliency_4, P_thermal
 
     @staticmethod
     def _sigmoid_smooth(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -403,21 +426,30 @@ class TMSOD(nn.Module):
         pred_logit: torch.Tensor,
         gt_mask: torch.Tensor,
         gt_edge: torch.Tensor,
-        lambda_bce: float = 0.5,
-        lambda_dice: float = 0.5,
+        lambda_sal: float = 1.0,
         lambda_sm: float = 0.8,
         lambda_edge: float = 0.5,
         lambda_cons: float = 0.1,
     ) -> torch.Tensor:
+        
+        l_sal = 0.0
         pred_prob = torch.sigmoid(pred_logit)
-        l_bce = self.loss_bce(pred_prob, gt_mask)
-        l_dice = self.loss_dice(pred_prob, gt_mask)
+        l_sal += self.loss_bce(pred_prob, gt_mask) + self.loss_dice(pred_prob, gt_mask)
+        
+        if hasattr(self, 'saliency_maps') and self.saliency_maps is not None:
+            for sal_map in self.saliency_maps:
+                sal_resized = F.interpolate(sal_map, size=gt_mask.shape[-2:], 
+                                           mode='bilinear', align_corners=False)
+                l_sal += self.loss_bce(sal_resized, gt_mask) + self.loss_dice(sal_resized, gt_mask)
+        
         l_sm = self.loss_smooth(pred_prob, gt_mask)
+        
         l_edge = self.edge_alignment_loss(pred_prob, gt_edge)
+        
         l_cons = self.consistency_loss()
+        
         return (
-            lambda_bce * l_bce
-            + lambda_dice * l_dice
+            lambda_sal * l_sal
             + lambda_sm * l_sm
             + lambda_edge * l_edge
             + lambda_cons * l_cons
@@ -467,17 +499,26 @@ class TMSOD(nn.Module):
         loss_layer4 = 0
         if hasattr(self, "feat_r2t4") and hasattr(self, "t4_orig"):
             loss_r2t4 = _dist_loss(self.feat_r2t4, self.t4_orig)
-            loss_layer4 = loss_r2t4
+            loss_layer4 += loss_r2t4
+        if hasattr(self, "feat_t2r4") and hasattr(self, "r4_orig"):
+            loss_t2r4 = _dist_loss(self.feat_t2r4, self.r4_orig)
+            loss_layer4 += loss_t2r4
 
         loss_layer3 = 0
         if hasattr(self, "feat_r2t3") and hasattr(self, "t3_orig"):
             loss_r2t3 = _dist_loss(self.feat_r2t3, self.t3_orig)
-            loss_layer3 = loss_r2t3
+            loss_layer3 += loss_r2t3
+        if hasattr(self, "feat_t2r3") and hasattr(self, "r3_orig"):
+            loss_t2r3 = _dist_loss(self.feat_t2r3, self.r3_orig)
+            loss_layer3 += loss_t2r3
 
         loss_layer2 = 0
         if hasattr(self, "feat_r2t2") and hasattr(self, "t2_orig"):
             loss_r2t2 = _dist_loss(self.feat_r2t2, self.t2_orig)
-            loss_layer2 = loss_r2t2
+            loss_layer2 += loss_r2t2
+        if hasattr(self, "feat_t2r2") and hasattr(self, "r2_orig"):
+            loss_t2r2 = _dist_loss(self.feat_t2r2, self.r2_orig)
+            loss_layer2 += loss_t2r2
 
         loss_consist = loss_layer4 + loss_layer3 + loss_layer2
 
@@ -518,7 +559,15 @@ class GMSA_layer_ini(nn.Module):
         self.sigmoid = nn.Sigmoid()
         self.relu = nn.ReLU(inplace=True)
 
-        self.saliency_conv = nn.Conv2d(d_model, 1, kernel_size=1)
+        self.saliency_head = nn.Sequential(
+            nn.Conv2d(d_model, d_model // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(d_model // 2, d_model // 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(d_model // 4, 1, kernel_size=1)
+        )
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, fr, ft, pos=None, query_pos=None):
@@ -540,7 +589,7 @@ class GMSA_layer_ini(nn.Module):
         assert H * W == L, f"Resolution mismatch: {H}x{W} should equal {L}"
 
         fr_img = fr.transpose(1, 2).view(B, C, H, W)
-        p_sal_map = self.saliency_conv(fr_img)
+        p_sal_map = self.saliency_head(fr_img)
         p_saliency = self.sigmoid(p_sal_map)
 
         fr_out = fr_img.view(B, C, H * W).transpose(1, 2)
@@ -561,6 +610,83 @@ def _get_activation_fn(activation):
         return F.glu
     raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
 
+class DeformableValueAttention(nn.Module):
+    def __init__(self, dim, num_heads=8):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        
+        self.out_proj = nn.Linear(dim, dim)
+        
+        self.lambda_p = nn.Parameter(torch.tensor(1.0))
+        self.gamma_val = nn.Parameter(torch.tensor(0.1))
+        
+        self.softmax = nn.Softmax(dim=-1)
+        
+    def forward(self, q_feat, kv_feat, offsets, saliency_map, P_thermal=None):
+        B, C, H, W = q_feat.shape
+        
+        q_feat_flat = q_feat.flatten(2).transpose(1, 2)
+        kv_feat_flat = kv_feat.flatten(2).transpose(1, 2)
+        
+        Q = self.q_proj(q_feat_flat).reshape(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(kv_feat_flat).reshape(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(kv_feat_flat).reshape(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        attn = (Q @ K.transpose(-2, -1)) * self.scale
+        
+        if P_thermal is not None:
+            P_flat = P_thermal.flatten(2).transpose(1, 2).unsqueeze(1)
+            attn = attn + self.lambda_p * P_flat.mean(-1, keepdim=True)
+        
+        attn_weights = self.softmax(attn)
+        
+        saliency_flat = saliency_map.flatten(2).transpose(1, 2)
+        value_modulation = 1.0 + self.gamma_val * saliency_flat.unsqueeze(1)
+        V_modulated = V * value_modulation
+        
+        V_modulated_spatial = V_modulated.transpose(1, 2).reshape(B, H*W, C).transpose(1, 2).reshape(B, C, H, W)
+        V_deformed = self._deformable_sampling(V_modulated_spatial, offsets)
+        
+        V_deformed_flat = V_deformed.flatten(2).transpose(1, 2).reshape(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        out = (attn_weights @ V_deformed_flat).transpose(1, 2).reshape(B, H*W, C)
+        out = self.out_proj(out)
+        
+        out = out.transpose(1, 2).reshape(B, C, H, W)
+        return out
+    
+    def _deformable_sampling(self, features, offsets):
+        B, C, H, W = features.shape
+        
+        y_grid, x_grid = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=features.device),
+            torch.linspace(-1, 1, W, device=features.device),
+            indexing='ij'
+        )
+        base_grid = torch.stack([x_grid, y_grid], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)
+        
+        offset_x = offsets[:, 0:1, :, :].permute(0, 2, 3, 1) / (W / 2)
+        offset_y = offsets[:, 1:2, :, :].permute(0, 2, 3, 1) / (H / 2)
+        offset_grid = torch.cat([offset_x, offset_y], dim=-1)
+        
+        sampling_grid = base_grid + offset_grid
+        
+        sampled_features = F.grid_sample(
+            features, sampling_grid, 
+            mode='bilinear', 
+            padding_mode='border', 
+            align_corners=False
+        )
+        
+        return sampled_features
+
 class get_aligned_feat(nn.Module):
     def __init__(self, inC, outC):
         super(get_aligned_feat, self).__init__()
@@ -569,37 +695,69 @@ class get_aligned_feat(nn.Module):
         self.deformConv2 = defomableConv(inC=inC, outC=outC)
         self.deformConv3 = defomableConv(inC=inC, outC=outC)
 
-        self.deformConv4_r2t = defomableConv_offset(inC=inC, outC=outC)
-        self.deformConv4_t2r = defomableConv_offset(inC=inC, outC=outC)
-
-        self.alpha = nn.Parameter(torch.tensor(0.5))
-
-        self.beta = nn.Parameter(torch.tensor(0.0))
+        self.deform_attn_t2r = DeformableValueAttention(dim=inC, num_heads=8)
+        self.deform_attn_r2t = DeformableValueAttention(dim=inC, num_heads=8)
+        
+        self.offset_net = nn.Sequential(
+            nn.Conv2d(inC * 2 + 1, inC, 3, padding=1),
+            nn.BatchNorm2d(inC),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inC, inC // 2, 3, padding=1),
+            nn.BatchNorm2d(inC // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inC // 2, 2 * 9, 3, padding=1)
+        )
+        
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(inC * 2, inC, 3, padding=1),
+            nn.BatchNorm2d(inC),
+            nn.ReLU(inplace=True)
+        )
 
         self.gamma_sem = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, fr, ft, thermal_mask=None, value_gate=None):
-        cat_feat = torch.cat((fr, ft), dim=1)
-        feat1 = self.deformConv1(cat_feat)
-        feat2 = self.deformConv2(feat1)
-        feat3 = self.deformConv3(feat2)
-
-        if value_gate is not None:
-            gate = 1.0 + self.gamma_sem * value_gate
-            ft = ft * gate
-            fr = fr * gate
-        aligned_feat_r2t = self.deformConv4_r2t(feat3, ft, thermal_mask=thermal_mask, beta=self.beta)
-
-        aligned_feat_t2r = self.deformConv4_t2r(
-            feta3 = feat3,
-            x = fr,
-            thermal_mask = thermal_mask,
-            beta = self.beta
+    def forward(self, fr, ft, P_thermal=None, saliency_map=None):
+        
+        if saliency_map is not None:
+            gate = 1.0 + self.gamma_sem * saliency_map
+            ft_gated = ft * gate
+            fr_gated = fr * gate
+        else:
+            ft_gated = ft
+            fr_gated = fr
+        
+        if saliency_map is not None:
+            offset_input = torch.cat([fr_gated, ft_gated, saliency_map], dim=1)
+        else:
+            B, C, H, W = fr_gated.shape
+            zero_sal = torch.zeros(B, 1, H, W, device=fr_gated.device)
+            offset_input = torch.cat([fr_gated, ft_gated, zero_sal], dim=1)
+        
+        offsets = self.offset_net(offset_input)
+        
+        Z_t = self.deform_attn_t2r(
+            q_feat=ft_gated,
+            kv_feat=fr_gated,
+            offsets=offsets,
+            saliency_map=saliency_map if saliency_map is not None else torch.ones_like(ft[:, :1]),
+            P_thermal=P_thermal
         )
+        
+        zero_offsets = torch.zeros_like(offsets)
+        
+        Z_r = self.deform_attn_r2t(
+            q_feat=fr_gated,
+            kv_feat=ft_gated,
+            offsets=zero_offsets,
+            saliency_map=saliency_map if saliency_map is not None else torch.ones_like(fr[:, :1]),
+            P_thermal=None
+        )
+        
+        F_concat = torch.cat([Z_r, Z_t], dim=1)
+        
+        F_final = self.fusion_conv(F_concat)
 
-        F_final = self.alpha * aligned_feat_r2t + (1.0 - self.alpha) * aligned_feat_t2r
-
-        return F_final, aligned_feat_r2t, aligned_feat_t2r
+        return F_final, Z_t, Z_r
 
 class defomableConv(nn.Module):
     def __init__(self, inC, outC, kH = 3, kW = 3, num_deformable_groups = 4):
@@ -625,11 +783,12 @@ class defomableConv_offset(nn.Module):
         self.outC = outC
         self.kH = kH
         self.kW = kW
-        self.offset = nn.Conv2d(inC, num_deformable_groups * 2 * kH * kW, kernel_size=(kH, kW), stride=(1, 1), padding=(1, 1), bias=False)
+        self.offset = nn.Conv2d(2 * inC + 1, num_deformable_groups * 2 * kH * kW, kernel_size=(kH, kW), stride=(1, 1), padding=(1, 1), bias=False)
         self.deform = DeformConv2d(inC, outC, (kH, kW), stride=1, padding=1, groups=num_deformable_groups)
 
-    def forward(self, feta3, x, thermal_mask=None, beta=None):
-        offset = self.offset(feta3)
+    def forward(self, feat3, fr, ft, saliency_map, x, thermal_mask=None, beta=None):
+        offset_input = torch.cat([fr, ft, saliency_map], dim=1)
+        offset = self.offset(offset_input)
 
         if (thermal_mask is not None) and (beta is not None):
             thermal_mask_expanded = thermal_mask.expand(-1, offset.shape[1], -1, -1)

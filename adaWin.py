@@ -64,7 +64,8 @@ class WindowAttention(nn.Module):
 
         self.lambda_ = nn.Parameter(torch.tensor(1.0))
 
-        self.qkv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv_proj = nn.Linear(dim, dim * 2, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -72,33 +73,14 @@ class WindowAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, y, P_thermal=None,mask=None):
-        """
-        TPMA: Physics-Guided Asymmetric Cross-Attention
-        
-        This function implements the cross-modal fusion with physical prior modulation:
-        - Q from x (e.g., RGB features)
-        - K, V from y (e.g., Thermal features) 
-        - P_thermal: Physical prior to suppress unreliable thermal regions
-        
-        Args:
-            x: Query features (e.g., RGB) - shape: (B_, N, C)
-            y: Key/Value features (e.g., Thermal) - shape: (B_, N, C)
-            P_thermal: Physical prior tensor to modulate attention weights
-            mask: Optional attention mask
-        
-        Returns:
-            Enhanced features with cross-modal attention and physics guidance
-        """
         B_, N, C = x.shape
-        # Extract Q from x (query from first modality, e.g., RGB)
-        q = x.reshape(B_, self.num_heads, N, C // self.num_heads)
         
-        # Extract K, V from y (key/value from second modality, e.g., Thermal)
-        kv = self.qkv(y).reshape(B_, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q = self.q_proj(x).reshape(B_, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        
+        kv = self.kv_proj(y).reshape(B_, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         k, v = kv[0], kv[1]
 
         q = q * self.scale
-        # Compute attention scores: Q @ K^T (cross-attention: Q from x, K from y)
         attn = (q @ k.transpose(-2, -1))
 
         attn = attn
@@ -108,7 +90,6 @@ class WindowAttention(nn.Module):
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
 
-        # ========== TPMA: Physical Prior Injection ==========
         if P_thermal is not None:
             B_, heads, N, _ = attn.shape
             P_thermal = P_thermal.view(B_, -1, N, N)
@@ -118,15 +99,11 @@ class WindowAttention(nn.Module):
             elif P_thermal.shape[1] < heads:
                 P_thermal = P_thermal.repeat(1, heads // P_thermal.shape[1], 1, 1)
 
-        # Inject physical prior to modulate attention weights
-        # This suppresses attention in unreliable thermal regions
-        attn = attn + self.lambda_ * P_thermal
-        # ========== End of TPMA: Physical Prior Injection ==========
+            attn = attn + self.lambda_ * P_thermal
 
         attn = self.softmax(attn)
         attn = self.attn_drop(attn)
 
-        # Weighted sum: attention @ value (V from y)
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -209,22 +186,6 @@ class SwinTransformerBlock(nn.Module):
         self.register_buffer("attn_mask", attn_mask)
 
     def forward(self, x, y, semantic=None, P_thermal=None, p_saliency=None, alpha=4, threshold_sal=0.3,use_global=False):
-        """
-        SwinTransformerBlock: Integrates TPMA and TSM-CWI components
-        
-        This block performs THREE integrated functions:
-        1. TPMA: Physics-Guided Asymmetric Cross-Attention (via WindowAttention.forward)
-        2. TSM-CWI: Saliency-Aware Dynamic Windowing (lines 246-279)
-        3. TSM-CWI: Semantic Gating (lines 303-307)
-        
-        Args:
-            x: First modality features (e.g., RGB)
-            y: Second modality features (e.g., Thermal)
-            semantic: Semantic features for gating
-            P_thermal: Physical prior from TPMA module
-            p_saliency: Saliency map for dynamic windowing
-            threshold_sal: Threshold for dynamic window size selection
-        """
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -235,7 +196,6 @@ class SwinTransformerBlock(nn.Module):
         y = y.view(B, H, W, C)
 
         if self.shift_size > 0:
-
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
             shifted_y = torch.roll(y, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
             if p_saliency is not None:
@@ -249,37 +209,33 @@ class SwinTransformerBlock(nn.Module):
             shifted_y = y
             shifted_sal = p_saliency
         
-        # ========== TSM-CWI: Step 1 - Compute saliency statistics for each window ==========
         mean_sal = None
+        global_mean_sal = None
         if shifted_sal is not None:
             shifted_sal = F.interpolate(shifted_sal, size=self.input_resolution, mode='bilinear', align_corners=False)
             sal_4d = shifted_sal.permute(0, 2, 3, 1)
             sal_windows = window_partition(sal_4d, self.window_size1)
             sal_windows = sal_windows.view(-1, self.window_size1 * self.window_size1)
-            mean_sal = sal_windows.mean(dim=1)  # Average saliency per window
+            mean_sal = sal_windows.mean(dim=1)
+            
+            global_mean_sal = mean_sal.mean()
 
-        # Partition x into fixed-size windows
         x_windows = window_partition(shifted_x, self.window_size1)
         x_windows = x_windows.view(-1, self.window_size1 * self.window_size1, C)
 
-        # ========== TSM-CWI: Step 2 - Dynamic Window Size Selection ==========
-        # Adaptively select window size based on saliency:
-        # - High saliency → small window (preserve details)
-        # - Low saliency → large window (capture context)
-        if mean_sal is not None:
+        if global_mean_sal is not None:
             num_windows = mean_sal.shape[0]
             base_size = self.window_size2
             w_small = max(base_size - 2, 4)
             w_large = min(base_size + 2, 8)
             
-            window_sizes = torch.where(mean_sal >= threshold_sal, 
-                                     torch.tensor(w_small, device=mean_sal.device),
-                                     torch.tensor(w_large, device=mean_sal.device))
+            if global_mean_sal >= threshold_sal:
+                w_star = w_small
+            else:
+                w_star = w_large
             
             y_windows_list = []
             for i in range(num_windows):
-                window_size = window_sizes[i].item()
-                
                 windows_per_row = W // self.window_size1
                 row = i // windows_per_row
                 col = i % windows_per_row
@@ -291,15 +247,15 @@ class SwinTransformerBlock(nn.Module):
                 
                 window_feature = shifted_y[:, start_h:end_h, start_w:end_w, :]
                 
-                if window_size != self.window_size1:
+                if w_star != self.window_size1:
                     window_feature = F.interpolate(
                         window_feature.permute(0, 3, 1, 2), 
-                        size=(window_size, window_size), 
+                        size=(w_star, w_star), 
                         mode='bilinear', 
                         align_corners=False
                     ).permute(0, 2, 3, 1)
                 
-                window_flat = window_feature.view(-1, window_size * window_size, C)
+                window_flat = window_feature.view(-1, w_star * w_star, C)
                 y_windows_list.append(window_flat)
             
             y_windows = torch.cat(y_windows_list, dim=0)
@@ -319,7 +275,6 @@ class SwinTransformerBlock(nn.Module):
                 fused_y_windows.append(fused_patch)
             y_windows = torch.stack(fused_y_windows, dim=0)
 
-        # ========== TPMA: Prepare physical prior for attention modulation ==========
         if P_thermal.dim() == 3:
             B, HW, C = P_thermal.shape
             P_thermal = P_thermal.transpose(1, 2).view(B, C, H, W)
@@ -328,10 +283,7 @@ class SwinTransformerBlock(nn.Module):
             P_thermal = F.interpolate(P_thermal, size=(H, W), mode='bilinear', align_corners=False)
             P_thermal = window_partition(P_thermal.permute(0, 2, 3, 1),self.window_size1)
             P_thermal = P_thermal.view(-1, self.window_size1 * self.window_size1, C)
-        # ========== End of TPMA: Physical prior preparation ==========
 
-        # ========== TSM-CWI: Step 3 - Semantic Gating ==========
-        # Enhance salient regions by modulating features with semantic guidance
         if semantic is not None:
             semantic = self.conv_sem(self.upSample(semantic))
             semantic = semantic.flatten(2).transpose(1, 2).view(B, H, W, C)
@@ -339,11 +291,9 @@ class SwinTransformerBlock(nn.Module):
                 shifted_sem = torch.roll(semantic, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
             else:
                 shifted_sem = semantic
-            if mean_sal is not None:
+            if global_mean_sal is not None:
                 sem_windows_list = []
                 for i in range(num_windows):
-                    window_size = window_sizes[i].item()
-                    
                     windows_per_row = W // self.window_size1
                     row = i // windows_per_row
                     col = i % windows_per_row
@@ -355,31 +305,29 @@ class SwinTransformerBlock(nn.Module):
                     
                     sem_window = shifted_sem[:, start_h:end_h, start_w:end_w, :]
                     
-                    if window_size != self.window_size1:
+                    if w_star != self.window_size1:
                         sem_window = F.interpolate(
                             sem_window.permute(0, 3, 1, 2), 
-                            size=(window_size, window_size), 
+                            size=(w_star, w_star), 
                             mode='bilinear', 
                             align_corners=False
                         ).permute(0, 2, 3, 1)
                     
-                    sem_window_flat = sem_window.view(-1, window_size * window_size, C)
+                    sem_window_flat = sem_window.view(-1, w_star * w_star, C)
                     sem_windows_list.append(sem_window_flat)
                 
                 sem_windows = torch.cat(sem_windows_list, dim=0)
             else:
                 sem_windows = window_partition(shifted_sem, self.window_size2)
                 sem_windows = sem_windows.view(-1, self.window_size2 * self.window_size2, C)
-            # Apply semantic gating to enhance salient regions
+            
+            sem_windows_x = window_partition(shifted_sem, self.window_size1)
+            sem_windows_x = sem_windows_x.view(-1, self.window_size1 * self.window_size1, C)
+            
             y_windows = y_windows * (1 + self.gamma_sem * sem_windows)
-        # ========== End of TSM-CWI: Semantic Gating ==========
+            x_windows = x_windows * (1 + self.gamma_sem * sem_windows_x)
 
-        # ========== TPMA: Physics-Guided Asymmetric Cross-Attention ==========
-        # This calls WindowAttention.forward which performs:
-        # - Cross-attention (Q from x, K/V from y)
-        # - Physical prior injection (P_thermal modulation)
         attn_windows = self.attn(x_windows, y_windows, P_thermal=P_thermal, mask=self.attn_mask)
-        # ========== End of TPMA: Cross-Attention ==========
 
         attn_windows = attn_windows.view(-1, self.window_size1, self.window_size1, C)
         shifted_x = window_reverse(attn_windows, self.window_size1, H, W)

@@ -24,6 +24,29 @@ set_seed(42)
 
 from model import TMSOD
 
+def extract_boundary(gt_mask):
+
+    device = gt_mask.device
+    dtype = gt_mask.dtype
+    
+    # Sobel kernels for edge detection
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                           dtype=dtype, device=device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                           dtype=dtype, device=device).view(1, 1, 3, 3)
+    
+    # Apply Sobel operators
+    edge_x = F.conv2d(gt_mask, sobel_x, padding=1)
+    edge_y = F.conv2d(gt_mask, sobel_y, padding=1)
+    
+    # Compute edge magnitude
+    boundary = torch.sqrt(edge_x**2 + edge_y**2 + 1e-6)
+    
+    # Normalize to [0, 1]
+    boundary = (boundary - boundary.min()) / (boundary.max() - boundary.min() + 1e-6)
+    
+    return boundary
+
 # Note: The following utility modules can be manually constructed by users:
 # - RGBTTMSODDataset: Custom dataset class for RGB-T multi-modal salient object detection
 # - SmoothnessLoss, CombinedLoss: Custom loss functions for training
@@ -101,15 +124,17 @@ else:
     model.MSA4_r.window_size2 = 4
     model.MSA4_t.window_size2 = 4
 
-criterion = CombinedLoss(weight_dice=0.5, weight_bce=0.5).to(device)
-
 optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
 scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
 scaler = GradScaler('cuda')
 
+# MOCT loss components tracking
 epoch_loss_meter = AverageMeter('TrainLoss')
-train_consistency_meter = AverageMeter('TrainConsistency')
+train_sal_meter = AverageMeter('L_sal')
+train_sm_meter = AverageMeter('L_sm')
+train_edge_meter = AverageMeter('L_edge')
+train_consistency_meter = AverageMeter('L_cons')
 
 print("Start Training...")
 best_mae = 1.0
@@ -117,30 +142,48 @@ best_mae = 1.0
 if not os.path.exists(log_path):
     with open(log_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Epoch', 'Train_Loss', 'Val_Loss', 'MAE', 'F-measure', 'S-measure', 'E-measure', 'Consistency_Loss'])
+        writer.writerow(['Epoch', 'Train_Loss', 'Val_Loss', 'MAE', 'F-measure', 'S-measure', 'E-measure'])
 
 for epoch in range(num_epochs):
     model.train()
     epoch_loss_meter.reset()
+    train_sal_meter.reset()
+    train_sm_meter.reset()
+    train_edge_meter.reset()
     train_consistency_meter.reset()
 
     train_loader_tqdm = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{num_epochs}] Training", ncols=120)
 
     for i, (rgb, gt, thermal) in enumerate(train_loader_tqdm):
         rgb, gt, thermal = rgb.to(device), gt.to(device), thermal.to(device)
+        
+        gt_edge = extract_boundary(gt)
 
         optimizer.zero_grad()
 
         with autocast('cuda'):
             pred, p_saliency, P_thermal = model(rgb, thermal)
-            loss = criterion(pred, gt)
+            
             if use_multi_gpu:
-                consistency_loss = model.module.consistency_loss()
+                total_loss = model.module.moct_loss(
+                    pred_logit=pred,
+                    gt_mask=gt,
+                    gt_edge=gt_edge,
+                    lambda_sal=1.0,
+                    lambda_sm=0.8,
+                    lambda_edge=0.5,
+                    lambda_cons=0.1
+                )
             else:
-                consistency_loss = model.consistency_loss()
-            if isinstance(consistency_loss, (int, float)):
-                consistency_loss = torch.tensor(consistency_loss, device=device, dtype=torch.float32)
-            total_loss = loss + 0.1 * consistency_loss
+                total_loss = model.moct_loss(
+                    pred_logit=pred,
+                    gt_mask=gt,
+                    gt_edge=gt_edge,
+                    lambda_sal=1.0,
+                    lambda_sm=0.8,
+                    lambda_edge=0.5,
+                    lambda_cons=0.1
+                )
 
         scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
@@ -148,13 +191,11 @@ for epoch in range(num_epochs):
         scaler.step(optimizer)
         scaler.update()
 
-        epoch_loss_meter.update(loss.item(), rgb.size(0))
-        train_consistency_meter.update(consistency_loss.item(), rgb.size(0))
+        epoch_loss_meter.update(total_loss.item(), rgb.size(0))
 
         train_loader_tqdm.set_postfix({
-            "BatchLoss": f"{loss.item():.4f}",
-            "AvgLoss": f"{epoch_loss_meter.avg:.4f}",
-            "Consis": f"{consistency_loss.item():.4f}"
+            "BatchLoss": f"{total_loss.item():.4f}",
+            "AvgLoss": f"{epoch_loss_meter.avg:.4f}"
         })
 
     scheduler.step()
@@ -170,15 +211,41 @@ for epoch in range(num_epochs):
         val_loader_tqdm = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{num_epochs}] Validation", ncols=120)
         for i, (rgb, gt, thermal) in enumerate(val_loader_tqdm):
             rgb, gt, thermal = rgb.to(device), gt.to(device), thermal.to(device)
+            
+            # Extract boundary for validation loss computation
+            gt_edge = extract_boundary(gt)
+            
             pred, _, _ = model(rgb, thermal)
-            val_loss = criterion(pred, gt)
+            
+            # Use complete MOCT loss for validation as well
+            if use_multi_gpu:
+                val_loss = model.module.moct_loss(
+                    pred_logit=pred,
+                    gt_mask=gt,
+                    gt_edge=gt_edge,
+                    lambda_sal=1.0,
+                    lambda_sm=0.8,
+                    lambda_edge=0.5,
+                    lambda_cons=0.1
+                )
+            else:
+                val_loss = model.moct_loss(
+                    pred_logit=pred,
+                    gt_mask=gt,
+                    gt_edge=gt_edge,
+                    lambda_sal=1.0,
+                    lambda_sm=0.8,
+                    lambda_edge=0.5,
+                    lambda_cons=0.1
+                )
             val_loss_meter.update(val_loss.item(), rgb.size(0))
 
-            pred = (pred > 0.5).float()
-            mae = torch.abs(pred - gt).mean()
-            f_measure = (2 * (pred * gt).sum() + 1e-5) / (pred.sum() + gt.sum() + 1e-5)
-            s_measure = 1 - (torch.abs(pred - gt).sum() + 1e-5) / (torch.max(pred, gt).sum() + 1e-5)
-            e_measure = (((2 * (pred - pred.mean()) * (gt - gt.mean())) / ((pred - pred.mean())**2 + (gt - gt.mean())**2 + 1e-5) + 1) / 2).mean()
+            pred_prob = torch.sigmoid(pred)
+            pred_binary = (pred_prob > 0.5).float()
+            mae = torch.abs(pred_prob - gt).mean()
+            f_measure = (2 * (pred_binary * gt).sum() + 1e-5) / (pred_binary.sum() + gt.sum() + 1e-5)
+            s_measure = 1 - (torch.abs(pred_binary - gt).sum() + 1e-5) / (torch.max(pred_binary, gt).sum() + 1e-5)
+            e_measure = (((2 * (pred_prob - pred_prob.mean()) * (gt - gt.mean())) / ((pred_prob - pred_prob.mean())**2 + (gt - gt.mean())**2 + 1e-5) + 1) / 2).mean()
 
             mae_meter.update(mae.item(), rgb.size(0))
             f_measure_meter.update(f_measure.item(), rgb.size(0))
@@ -197,13 +264,12 @@ for epoch in range(num_epochs):
     with open(log_path, 'a', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([epoch, epoch_loss_meter.avg, val_loss_meter.avg, mae_meter.avg,
-                         f_measure_meter.avg, s_measure_meter.avg, e_measure_meter.avg, train_consistency_meter.avg])
+                         f_measure_meter.avg, s_measure_meter.avg, e_measure_meter.avg])
 
     print(f"Epoch [{epoch+1}/{num_epochs}] "
-          f"- Train Loss: {epoch_loss_meter.avg:.4f}, "
-          f"Val Loss: {val_loss_meter.avg:.4f}, "
+          f"- Train Loss (MOCT): {epoch_loss_meter.avg:.4f}, "
+          f"Val Loss (MOCT): {val_loss_meter.avg:.4f}, "
           f"MAE: {mae_meter.avg:.4f}, "
           f"F-measure: {f_measure_meter.avg:.4f}, "
           f"S-measure: {s_measure_meter.avg:.4f}, "
-          f"E-measure: {e_measure_meter.avg:.4f}, "
-          f"Consistency Loss: {train_consistency_meter.avg:.4f}")
+          f"E-measure: {e_measure_meter.avg:.4f}")
