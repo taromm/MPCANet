@@ -22,19 +22,6 @@ def conv3x3_bn_relu(in_planes, out_planes, stride=1):
         nn.ReLU(inplace=True),
     )
 
-class BasicConv2d(nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1):
-        super(BasicConv2d, self).__init__()
-        self.conv = nn.Conv2d(in_planes, out_planes,
-                              kernel_size=kernel_size, stride=stride,
-                              padding=padding, dilation=dilation, bias=False)
-        self.bn = nn.BatchNorm2d(out_planes)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        return x
 
 class SaliencyHead(nn.Module):
     def __init__(self, in_channels, resolution):
@@ -132,53 +119,6 @@ class TMSOD(nn.Module):
         self.conv3x3_U2 = conv3x3_bn_relu(256 + 256, 128)
         self.conv3x3_U1 = conv3x3_bn_relu(128 + 128, 64)
         
-        self.edge_preproj_4 = nn.Conv2d(1024 + 1024, 256, kernel_size=1)
-        self.edge_preproj_3 = nn.Conv2d(512 + 512, 256, kernel_size=1)
-        self.edge_preproj_2 = nn.Conv2d(256 + 256, 256, kernel_size=1)
-        self.edge_preproj_1 = nn.Conv2d(128 + 128, 256, kernel_size=1)
-
-        self.shallow_fusion = nn.Sequential(
-            nn.Conv2d(128 + 128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(0.2)
-        )
-
-        self.decode4 = nn.Sequential(
-            nn.Conv2d(256, 512, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(0.2)
-        )
-
-        self.decode3 = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(0.2)
-        )
-
-        self.decode2 = nn.Sequential(
-            nn.Conv2d(256, 128, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(0.2)
-        )
-
-        self.decode1 = nn.Sequential(
-            nn.Conv2d(256, 64, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(0.2)
-        )
-
         self.conv64 = conv3x3(64, 1)
         self.up2 = nn.UpsamplingBilinear2d(scale_factor=2)
         self.up4 = nn.UpsamplingBilinear2d(scale_factor=4)
@@ -195,9 +135,6 @@ class TMSOD(nn.Module):
         self.pred_saliency = None
         self.debug_thermal = None
         self.P_thermal = self.thermal_prior
-        self.attention4 = nn.MultiheadAttention(embed_dim=1024, num_heads=8)
-        self.attention3 = nn.MultiheadAttention(embed_dim=512, num_heads=8)
-        self.attention2 = nn.MultiheadAttention(embed_dim=256, num_heads=8)
         
         self.gamma_dec = nn.Parameter(torch.tensor(0.1))
 
@@ -301,7 +238,6 @@ class TMSOD(nn.Module):
                               alpha=4,
                               threshold_sal=0.3)
 
-        f1 = self.shallow_fusion(torch.cat([fr[0], ft[0]], dim=1))
 
         r4 = att_4_r.view(att_4_r.shape[0], fr[3].shape[2], fr[3].shape[3], -1).permute(0, 3, 1, 2).contiguous()
         t4 = att_4_t.view(att_4_t.shape[0], fr[3].shape[2], fr[3].shape[3], -1).permute(0, 3, 1, 2).contiguous()
@@ -437,7 +373,6 @@ class TMSOD(nn.Module):
     ) -> torch.Tensor:
         
         l_sal = 0.0
-        pred_prob = torch.sigmoid(pred_logit)
         if hasattr(self, 'saliency_maps') and self.saliency_maps is not None:
             for sal_map in self.saliency_maps:
                 sal_resized = F.interpolate(sal_map, size=gt_mask.shape[-2:], 
@@ -793,27 +728,5 @@ class defomableConv(nn.Module):
 
     def forward(self, x):
         offset = self.offset(x)
-        out = self.deform(x, offset)
-        return out
-
-class defomableConv_offset(nn.Module):
-    def __init__(self, inC, outC, kH = 3, kW = 3, num_deformable_groups = 2):
-        super(defomableConv_offset, self).__init__()
-        self.num_deformable_groups = num_deformable_groups
-        self.inC = inC
-        self.outC = outC
-        self.kH = kH
-        self.kW = kW
-        self.offset = nn.Conv2d(2 * inC + 1, num_deformable_groups * 2 * kH * kW, kernel_size=(kH, kW), stride=(1, 1), padding=(1, 1), bias=False)
-        self.deform = DeformConv2d(inC, outC, (kH, kW), stride=1, padding=1, groups=num_deformable_groups)
-
-    def forward(self, feat3, fr, ft, saliency_map, x, thermal_mask=None, beta=None):
-        offset_input = torch.cat([fr, ft, saliency_map], dim=1)
-        offset = self.offset(offset_input)
-
-        if (thermal_mask is not None) and (beta is not None):
-            thermal_mask_expanded = thermal_mask.expand(-1, offset.shape[1], -1, -1)
-            offset = offset * (1.0 + beta * thermal_mask_expanded)
-
         out = self.deform(x, offset)
         return out

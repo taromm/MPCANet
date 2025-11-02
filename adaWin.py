@@ -63,6 +63,7 @@ class WindowAttention(nn.Module):
         self.scale = qk_scale or head_dim ** -0.5
 
         self.lambda_ = nn.Parameter(torch.tensor(1.0))
+        self.thermal_mask_proj = nn.Linear(dim, 1)
 
         self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.kv_proj = nn.Linear(dim, dim * 2, bias=qkv_bias)
@@ -77,7 +78,9 @@ class WindowAttention(nn.Module):
         
         q = self.q_proj(x).reshape(B_, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         
-        kv = self.kv_proj(y).reshape(B_, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        # y may have different number of tokens than x (asymmetric attention)
+        B_y, M, C_y = y.shape
+        kv = self.kv_proj(y).reshape(B_y, M, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         k, v = kv[0], kv[1]
 
         q = q * self.scale
@@ -87,19 +90,27 @@ class WindowAttention(nn.Module):
 
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
+            # mask has shape [nW, N, N], but attn has shape [B_, num_heads, N, M]
+            # For asymmetric attention, use only the first M columns of mask
+            mask_asym = mask[:, :, :M] if M <= N else torch.cat([mask, torch.zeros(nW, N, M-N, device=mask.device, dtype=mask.dtype)], dim=2)
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, M) + mask_asym.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, M)
 
         if P_thermal is not None:
-            B_, heads, N, _ = attn.shape
-            P_thermal = P_thermal.view(B_, -1, N, N)
-
-            if P_thermal.shape[1] != heads:
-                P_thermal = P_thermal[:, :heads, :, :]
-            elif P_thermal.shape[1] < heads:
-                P_thermal = P_thermal.repeat(1, heads // P_thermal.shape[1], 1, 1)
-
-            attn = attn + self.lambda_ * P_thermal
+            _, heads, _, M_kv = attn.shape
+            reliability_scores = self.thermal_mask_proj(P_thermal)
+            reliability_scores = torch.sigmoid(reliability_scores)
+            # For asymmetric attention, extend reliability_mask from [B_, N, N] to [B_, N, M]
+            reliability_mask_NN = reliability_scores @ reliability_scores.transpose(-2, -1)
+            if M_kv <= N:
+                reliability_mask = reliability_mask_NN[:, :, :M_kv]
+            else:
+                # Pad with zeros if M > N
+                pad = torch.zeros(B_, N, M_kv - N, device=reliability_mask_NN.device, dtype=reliability_mask_NN.dtype)
+                reliability_mask = torch.cat([reliability_mask_NN, pad], dim=2)
+            reliability_mask = reliability_mask.unsqueeze(1).expand(-1, heads, -1, -1)
+            reliability_mask = (reliability_mask - 0.5) * 2.0
+            attn = attn + self.lambda_ * reliability_mask
 
         attn = self.softmax(attn)
         attn = self.attn_drop(attn)
@@ -110,7 +121,7 @@ class WindowAttention(nn.Module):
         return x
 
     def extra_repr(self) -> str:
-        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
+        return f'dim={self.dim}, window_size1={self.window_size1}, window_size2={self.window_size2}, num_heads={self.num_heads}'
 
     def flops(self, N):
         flops = 0
@@ -164,11 +175,11 @@ class SwinTransformerBlock(nn.Module):
             print("shift_size > 0!!!!!")
             H, W = self.input_resolution
             img_mask = torch.zeros((1, H, W, 1))
-            h_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
+            h_slices = (slice(0, -self.window_size1),
+                        slice(-self.window_size1, -self.shift_size),
                         slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
+            w_slices = (slice(0, -self.window_size1),
+                        slice(-self.window_size1, -self.shift_size),
                         slice(-self.shift_size, None))
             cnt = 0
             for h in h_slices:
@@ -176,8 +187,8 @@ class SwinTransformerBlock(nn.Module):
                     img_mask[:, h, w, :] = cnt
                     cnt += 1
 
-            mask_windows = window_partition(img_mask, self.window_size)
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+            mask_windows = window_partition(img_mask, self.window_size1)
+            mask_windows = mask_windows.view(-1, self.window_size1 * self.window_size1)
             attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
             attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
         else:
@@ -332,7 +343,7 @@ class SwinTransformerBlock(nn.Module):
         attn_windows = attn_windows.view(-1, self.window_size1, self.window_size1, C)
         shifted_x = window_reverse(attn_windows, self.window_size1, H, W)
         if self.shift_size > 0:
-            x = torch.roll(shifted_x, shifts=(self.shift_size1, self.shift_size1), dims=(1, 2))
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x = shifted_x
         x = x.view(B, H * W, C)
@@ -343,14 +354,14 @@ class SwinTransformerBlock(nn.Module):
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
-               f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
+               f"window_size1={self.window_size1}, window_size2={self.window_size2}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
 
     def flops(self):
         flops = 0
         H, W = self.input_resolution
         flops += self.dim * H * W
-        nW = H * W / self.window_size / self.window_size
-        flops += nW * self.attn.flops(self.window_size * self.window_size)
+        nW = H * W / self.window_size1 / self.window_size1
+        flops += nW * self.attn.flops(self.window_size1 * self.window_size1)
         flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
         flops += self.dim * H * W
         return flops

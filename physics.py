@@ -120,7 +120,7 @@ class ThermalPhysicsPrior(nn.Module):
                 filtered = torch.fft.ifftshift(filtered, dim=(-2, -1))
                 response = torch.fft.ifft2(filtered, dim=(-2, -1))
                 
-                responses.append(torch.abs(response))
+                responses.append(response)
         
         emissivity_prior = torch.cat(responses, dim=1)
         
