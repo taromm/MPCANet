@@ -16,14 +16,7 @@ class ThermalPhysicsPrior(nn.Module):
         emissivity_channels = 4 * 8
         total_prior_channels = 1 + 1 + 1 + emissivity_channels
         
-        self.channel_alignment = nn.Sequential(
-            nn.Conv2d(total_prior_channels, 64, kernel_size=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True)
-        )
+        self.channel_alignment = nn.Conv2d(total_prior_channels, 128, kernel_size=1)
 
     def compute_temperature_gradient(self, thermal_image):
         sobel_x = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32, device=thermal_image.device).view(1, 1, 3, 3)
@@ -105,8 +98,7 @@ class ThermalPhysicsPrior(nn.Module):
             accum += diff
             I_s = I_s_next
         
-        inertia = 1.0 - self._normalize01(accum)
-        return inertia
+        return accum
 
     def compute_emissivity_prior(self, thermal_image, scales: Tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), orientations: int = 8):
         T = thermal_image.float()
